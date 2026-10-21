@@ -1,0 +1,109 @@
+name: release
+
+# Push a tag like v1.0.0 to publish. The tag must match `version` in pyproject.toml.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.9", "3.13"]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: pylinxi
+          POSTGRES_PASSWORD: pylinxi
+          POSTGRES_DB: pylinxi
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U pylinxi" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      PYLINXI_PG_DSN: postgresql://pylinxi:pylinxi@localhost:5432/pylinxi
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - name: tag matches package version
+        run: |
+          version=$(python -c "import re,pathlib; print(re.search(r'^version = \"(.+)\"', pathlib.Path('pyproject.toml').read_text(), re.M).group(1))")
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match pyproject version $version"; exit 1
+          fi
+          init=$(python -c "import re,pathlib; print(re.search(r'__version__ = \"(.+)\"', pathlib.Path('pylinxi/__init__.py').read_text()).group(1))")
+          if [ "$init" != "$version" ]; then
+            echo "::error::pylinxi.__version__ ($init) does not match pyproject ($version)"; exit 1
+          fi
+      - run: pip install -e ".[dev]"
+      - run: ruff check pylinxi tests examples && mypy pylinxi
+      - run: python -W error::ResourceWarning -m unittest discover -s tests -t .
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install build twine && python -m build && twine check --strict dist/*
+      - name: smoke-test the wheel in a clean environment
+        run: |
+          python -m venv /tmp/smoke
+          /tmp/smoke/bin/pip install dist/*.whl
+          cd /tmp && /tmp/smoke/bin/python -c "import pylinxi; print(pylinxi.__version__)"
+          /tmp/smoke/bin/pylinxi --help > /dev/null
+      - uses: actions/upload-artifact@v6
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/pylinxi/
+    permissions:
+      id-token: write          # trusted publishing: no API token stored anywhere
+    steps:
+      - uses: actions/download-artifact@v6
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@v1.14.3
+
+  github-release:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v6
+        with:
+          name: dist
+          path: dist/
+      - name: create GitHub release with notes from CHANGELOG.md
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '$0 ~ "^## "v"( |$)" {f=1; next} /^## / && f {exit} f' CHANGELOG.md > notes.md
+          [ -s notes.md ] || echo "Release $GITHUB_REF_NAME" > notes.md
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            # release was drafted in the GitHub UI (which also created the tag): attach files, fill in notes
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+            if [ -z "$(gh release view "$GITHUB_REF_NAME" --json body --jq .body)" ]; then
+              gh release edit "$GITHUB_REF_NAME" --notes-file notes.md
+            fi
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* --title "pylinxi $version" --notes-file notes.md --verify-tag
+          fi
