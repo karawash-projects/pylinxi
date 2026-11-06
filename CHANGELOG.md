@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.1.1 — 2026-11-06
+
+Fixes from a fourth independent review. No API changes; journals are compatible both ways with 1.1.0.
+
+- **State changed in place while a write was pending could fail the run for good.** With file, SQLite and Postgres journals, an entry's state delta was encoded on the writer thread from live `ctx.state` objects; a flow (or a sibling branch) changing a state dict meanwhile made the write fail after the step had run, so the run failed and the step re-ran on every resume. Deltas and results are now copied (and redacted) on the event loop thread when the entry is built, at no extra cost.
+- **A swallowed strict divergence no longer lets new steps run.** `ReplayDivergence` is latched: if flow code swallows it (for example `asyncio.gather(..., return_exceptions=True)`), no further step, timer or wait starts and the run fails with it.
+- **A suspension swallowed by `gather(..., return_exceptions=True)` is reported** with a `suspension_ignored` event and a warning; the README now says not to wrap durable waits that way.
+- **`Worker(retry_failed=False)` no longer re-runs failed runs when a signal arrives.** A signal to a failed run now follows the `retry_failed` / backoff / `max_failures` rules; signals to completed runs are ignored.
+- **A signal sent while a run continues as new is delivered.** Signals that reached the old generation after it read its inbox (or just after its `done` entry) are forwarded to the next generation, exactly once.
+- **Steps in flight when the drain budget runs out finish and are journaled** (with their own grace period of `drain_timeout`) instead of being cancelled and re-run on resume.
+- README: what happens to cleanup steps on repeated failure is now described accurately (they replay when reached again with the same arguments).
+
 ## 1.1.0 — 2026-11-06
 
 Fixes every finding of the 1.0.0 production-readiness review (43 findings, all reproduced) plus several related bugs found while verifying it. Each has a regression test in `tests/test_review_1_1.py`. See "Upgrading from 1.0" in the README for intended behaviour changes.

@@ -371,6 +371,7 @@ class Context:
         self._inbox_seqs: Set[int] = set()
         self._signals_used: Dict[str, int] = {}
         self._diverged: Set[str] = set()
+        self._halt: Optional[ReplayDivergence] = None   # strict divergence: nothing new may run
         self._state_warned: Set[str] = set()
         superseded = self._superseded(history)
         for e in history:
@@ -505,6 +506,8 @@ class Context:
         return s if s is not None and s.ctx is self else self._root
 
     def _key(self, name: str, call: Optional[Tuple[tuple, dict]] = None) -> str:
+        if self._halt is not None:
+            raise ReplayDivergence(str(self._halt))
         scope = self._scope_now()
         self._note_progress(scope.prefix)
         n = scope.counters.get(name, 0)
@@ -549,8 +552,11 @@ class Context:
         self.emit("divergence", key, recorded=recorded, strict=self.strict)
         log.warning("%s", msg)
         if self.strict:
-            raise ReplayDivergence(msg + "; nothing new was run. Use ctx.patched() for intentional "
-                                         "changes, or flow(strict=False) to only report this.")
+            # latched: even if flow code swallows this (gather(return_exceptions=True), a broad
+            # `except BaseException`), no further step runs and the run fails with it
+            self._halt = ReplayDivergence(msg + "; nothing new was run. Use ctx.patched() for intentional "
+                                                "changes, or flow(strict=False) to only report this.")
+            raise self._halt
 
     def _note_progress(self, prefix: str) -> None:
         """Flow code in `prefix` kept going, so failures raised in it (or in branches
@@ -587,14 +593,16 @@ class Context:
 
     def _diff(self) -> Tuple[dict, list]:
         new = self._snapshot()
-        delta = {}
+        encoded: Dict[str, Any] = {}
         for k, v in new.items():
             if self._snap.get(k) != v:
-                delta[k] = (f"[UNSERIALIZABLE {type(self.state[k]).__name__}]"
-                            if v.startswith("\x00unserializable:") else self.state[k])
+                encoded[k] = (f"[UNSERIALIZABLE {type(self.state[k]).__name__}]"
+                              if v.startswith("\x00unserializable:") else json.loads(v))
         removed = [k for k in self._snap if k not in new]
         self._snap = new
-        return delta, removed
+        # decoded (and redacted) copies, made now on the loop thread: the writer thread
+        # must never encode live objects that flow code may still be changing
+        return self.journal.prepared_delta(encoded), removed
 
     def _entry(self, key: str, kind: str, result: Any, meta: dict, persisted: bool = True) -> Entry:
         delta, removed = self._diff()
@@ -605,7 +613,14 @@ class Context:
                 meta["pf"] = self._tags[key]
                 if key in self._arghash:
                     meta["ah"] = self._arghash[key]
-        return Entry(self.run_id, key, kind, result if persisted else None, delta, removed, meta, persisted)
+        if persisted and self.journal.blocking and result is not None:
+            try:                                   # same for the result: freeze it before handing it off
+                result = self.journal.codec.loads(self.journal.codec.dumps(result))
+            except Exception:  # noqa: BLE001 -- left as is: the append reports why it can't be journaled
+                pass
+        e = Entry(self.run_id, key, kind, result if persisted else None, delta, removed, meta, persisted)
+        e._prepared = True  # type: ignore[attr-defined]
+        return e
 
     def _submit(self, e: Entry) -> concurrent.futures.Future:
         """Queue an entry on this run's ordered writer: entries are written in the order
@@ -1187,6 +1202,10 @@ class Flow:
         s = start.result
         args, kwargs = tuple(s["args"]), s["kwargs"]
         generation, root = int(s.get("generation", 0)), s.get("root", run_id)
+        if generation > 0:
+            fwd = await self._io(self._forward_signals, run_id, root, generation, history)
+            if fwd is not None:
+                history.append(fwd)
 
         ctx = Context(run_id, self.journal, dict(s.get("state", {})), history, emit, generation, self.strict)
         ctx.drain_timeout = self.drain_timeout
@@ -1221,8 +1240,12 @@ class Flow:
                             await asyncio.wait([settle])
                             raise
         except Suspended as sp:
+            if ctx._halt is not None:
+                return await self._fail(ctx, ctx._halt, emit, events)
             return await self._suspend(ctx, sp, emit, events)
         except ContinueAsNew as c:
+            if ctx._halt is not None:
+                return await self._fail(ctx, ctx._halt, emit, events)
             new_id = f"{root}.g{generation + 1}"
             if new_id == run_id:  # pragma: no cover - defensive
                 raise RuntimeError("continue-as-new id collision") from None
@@ -1230,7 +1253,8 @@ class Flow:
             try:
                 await ctx._arecord("done", "done", {"args": list(c.args_), "kwargs": c.kwargs, "state": c.state,
                                                     "generation": generation + 1, "root": root,
-                                                    "signals": leftover}, {"continued_as": new_id})
+                                                    "signals": leftover},
+                                    {"continued_as": new_id, "inbox_seen": sorted(ctx._inbox_seqs)})
             except Exception as e:  # noqa: BLE001
                 return await self._fail(ctx, e, emit, events)
             emit("continued_as_new", next_run_id=new_id)
@@ -1247,6 +1271,16 @@ class Flow:
             _scope.reset(scope_token)
             _current.reset(token)
 
+        if ctx._halt is not None:                 # a divergence was swallowed by flow code
+            return await self._fail(ctx, ctx._halt, emit, events)
+        ignored = [t for t in ctx._finished_tasks if not t.cancelled() and isinstance(t.exception(), Suspended)]
+        if ignored:
+            # e.g. asyncio.gather(..., return_exceptions=True) around a durable wait: the run
+            # completes without having waited
+            emit("suspension_ignored", count=len(ignored))
+            log.warning("run %r completed although %d branch(es) suspended and flow code ignored it "
+                        "(asyncio.gather(..., return_exceptions=True) around ctx.wait_for/ctx.sleep?)",
+                        ctx.run_id, len(ignored))
         stale = ctx._history_keys - ctx._consumed
         if stale:
             emit("divergence", stale=sorted(stale))   # recorded steps the new code never reached
@@ -1256,6 +1290,33 @@ class Flow:
             return await self._fail(ctx, e, emit, events)
         emit("finished")
         return RunResult(run_id, "completed", output, ctx.state, events=events)
+
+    def _forward_signals(self, run_id: str, root: str, generation: int, history: List[Entry]) -> Optional[Entry]:
+        """Signals that reached the previous generation while it was handing over (sent
+        between its last inbox read and its `done` entry, or just after it) would be
+        stranded there: move them into this generation's inbox, exactly once. Runs while
+        this generation holds its run lock; forwarded entries are recorded by sequence."""
+        prev = root if generation == 1 else f"{root}.g{generation - 1}"
+        try:
+            prev_entries = self.journal.load(prev)
+        except UnknownRun:
+            return None
+        done = next((e for e in prev_entries if e.kind == "done" and e.meta.get("continued_as") == run_id), None)
+        if done is None:
+            return None
+        seen = done.meta.get("inbox_seen")
+        already = {q for e in history if e.kind == "inbox" and e.meta.get("forwarded_from") == prev
+                   for q in e.meta.get("seqs", [])}
+        missed = [e for e in prev_entries if e.kind == "inbox" and e.seq not in already
+                  and (e.seq > done.seq or (isinstance(seen, list) and e.seq not in seen))]
+        if not missed:
+            return None
+        inbox: Dict[str, List[Any]] = {}
+        for e in missed:
+            for k, vals in (e.result or {}).items():
+                inbox.setdefault(k, []).extend(vals)
+        return self.journal.append(Entry(run_id, "inbox", "inbox", inbox, {}, [],
+                                         {"forwarded_from": prev, "seqs": [e.seq for e in missed]}))
 
     async def _suspend(self, ctx: Context, sp: Suspended, emit: Callable[..., None],
                        events: List[dict]) -> Any:
@@ -1320,12 +1381,14 @@ class Flow:
     async def _finish_steps(self, ctx: Context) -> None:
         """The run is ending while branches still run. Steps already executing have
         (or will have) done their side effect: let them finish and journal their
-        result, bounded by drain_timeout, so a resume replays them instead of running
-        them again. No branch may start a new step meanwhile."""
+        result, so a resume replays them instead of running them again. No branch may
+        start a new step from here on, so this only ever waits for steps already
+        running: they get their own grace period (drain_timeout), even when draining
+        used up the shared budget."""
         ctx._closing = True
         busy = [t for t in ctx._tasks if not t.done() and t in ctx._in_step]
         if busy:
-            await asyncio.wait(busy, timeout=ctx._remaining())
+            await asyncio.wait(busy, timeout=max(ctx._remaining(), self.drain_timeout))
 
     @staticmethod
     async def _cancel_branches(ctx: Context) -> None:

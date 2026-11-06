@@ -43,7 +43,7 @@ from .policy import (
 )
 from .worker import TickReport, Worker
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 __all__ = [
     "flow", "step", "idempotency_key", "Flow", "Context", "RunResult", "Suspended", "ContinueAsNew",
     "ReplayedError", "ReplayDivergence", "ResultNotJournaled", "FlowMismatch", "RunExists",
