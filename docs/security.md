@@ -48,7 +48,7 @@ sensitive step, whose result is never journaled and is recomputed on resume:
 ```python
 @step(sensitive=True)
 def api_token(ref):
-    return vault.read(ref)
+    return secret_store.read(ref)
 ```
 
 ## Retention and erasure

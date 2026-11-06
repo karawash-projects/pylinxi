@@ -81,7 +81,8 @@ class Codec:
     Round-trips str/int/float/bool/None, lists, dicts (including non-string keys and
     dicts that happen to contain the tag key), tuples, sets, bytes, datetime, date,
     time, timedelta, Decimal and UUID out of the box, plus classes you `register()`:
-    dataclasses, pydantic models, plain classes with a __dict__, and Enums.
+    dataclasses, model classes with `model_dump()`, plain classes with a __dict__,
+    and Enums.
     Registered classes are identified by module + qualified name, so two classes
     called `Config` in different modules never collide. Unregistered custom objects
     (and unregistered Enums) raise TypeError instead of silently changing type on replay.
@@ -140,7 +141,7 @@ class Codec:
                 data = dict(vars(o))
             else:
                 raise TypeError(f"cannot journal {name}: registered classes must be dataclasses, "
-                                f"pydantic models, Enums or have a __dict__")
+                                f"model classes with model_dump(), Enums or have a __dict__")
             return {_TAG: name, "v": self.encode(data)}
         if isinstance(o, list):
             return [self.encode(v) for v in o]

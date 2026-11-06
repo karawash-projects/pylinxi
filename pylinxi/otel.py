@@ -11,8 +11,8 @@ the `pylinxi.run_id` attribute):
       ├─ pylinxi.step lookup_charges#0      events: breaker_open, fallback
       └─ pylinxi.step send#0                ERROR status if the step finally failed
 
-Uses only the OpenTelemetry *API*; configure the SDK/exporter (OTLP, Jaeger,
-Datadog, Honeycomb...) in your app as usual. Without an SDK configured, spans
+Uses only the OpenTelemetry *API*; configure the SDK and any exporter
+in your application as usual. Without an SDK configured, spans
 are no-ops.
 """
 from __future__ import annotations

@@ -20,8 +20,8 @@ Guarantees beyond the single-process journals:
   don't scan history.
 - Payloads are stored as TEXT (not JSONB) so signatures verify byte-for-byte.
 
-Session advisory locks need a real session: don't put a transaction-pooling proxy
-(e.g. pgbouncer in transaction mode) between pylinxi and Postgres.
+Session advisory locks need a real session: don't put a connection pooler in
+transaction-pooling mode between pylinxi and Postgres.
 """
 from __future__ import annotations
 

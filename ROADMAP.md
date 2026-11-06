@@ -30,10 +30,9 @@ compensation running exactly once.
 
 ## Later
 
-**LangChain / LangGraph interop.** Use any LangChain runnable, tool or chat model
-as a pylinxi step (with policies and journaling), and wrap a compiled LangGraph
-graph as a single durable step — so teams can adopt pylinxi without rewriting
-what already works.
+**Integration helpers.** Small adapters that turn existing tool functions and
+model clients into pylinxi steps (with policies and journaling) in one line, so
+existing code can adopt durable execution without being rewritten.
 
 **Dashboard.** A small, self-hosted read-only web UI over a journal: runs by
 status, a timeline per run (steps, retries, repairs, fallbacks, waits), state at
