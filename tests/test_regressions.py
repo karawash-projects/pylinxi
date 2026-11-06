@@ -57,18 +57,23 @@ class TestJournalIntegrity(unittest.TestCase):
     def test_02_many_instances_share_one_store(self):
         for make in (lambda: FileJournal(self.d), lambda: SQLiteJournal(f"{self.d}/x.db")):
             a, b = make(), make()
-            for i in range(6):
-                (a if i % 2 else b).append(__import__("pylinxi").Entry("shared", f"k{i}", "step", i))
+            E = __import__("pylinxi").Entry
+            a.append(E("shared", "start", "start", {}))    # a run's first entry is its start
+            for i in range(1, 6):
+                (a if i % 2 else b).append(E("shared", f"k{i}", "step", i))
             self.assertEqual([e.seq for e in a.load("shared")], list(range(6)))
             self.assertTrue(a.verify("shared"))
             b.delete("shared")
-            a.append(__import__("pylinxi").Entry("shared", "again", "step", 0))
+            a.append(E("shared", "start", "start", {}))
             self.assertEqual([e.seq for e in b.load("shared")], [0])
             self.assertTrue(b.verify("shared"))
             a.close()
             b.close()
 
     def test_02b_threads_appending_through_separate_instances(self):
+        with SQLiteJournal(f"{self.d}/t.db") as j0:
+            j0.append(__import__("pylinxi").Entry("t", "start", "start", {}))
+
         def writer(i):
             j = SQLiteJournal(f"{self.d}/t.db")
             for n in range(20):
@@ -81,19 +86,20 @@ class TestJournalIntegrity(unittest.TestCase):
         for t in ts:
             t.join()
         with SQLiteJournal(f"{self.d}/t.db") as j:
-            self.assertEqual([e.seq for e in j.load("t")], list(range(80)))
+            self.assertEqual([e.seq for e in j.load("t")], list(range(81)))
             self.assertTrue(j.verify("t"))
 
     def test_02c_simultaneous_open_of_a_fresh_sqlite_file(self):
         # CI found: concurrent PRAGMA journal_mode=WAL / CREATE TABLE raised "database is locked"
         path, n = f"{self.d}/race.db", 8
         barrier, errors = threading.Barrier(n), []
+        E = __import__("pylinxi").Entry
 
         def opener(i):
             try:
                 barrier.wait()
                 j = SQLiteJournal(path)
-                j.append(__import__("pylinxi").Entry("r", f"o{i}", "step", i))
+                j.append(E(f"r{i}", "start", "start", {}))
                 j.close()
             except Exception as e:  # noqa: BLE001
                 errors.append(repr(e))
@@ -105,8 +111,8 @@ class TestJournalIntegrity(unittest.TestCase):
             t.join()
         self.assertEqual(errors, [])
         with SQLiteJournal(path) as j:
-            self.assertEqual([e.seq for e in j.load("r")], list(range(n)))
-            self.assertTrue(j.verify("r"))
+            self.assertEqual(sorted(j.runs()), sorted(f"r{i}" for i in range(n)))
+            self.assertTrue(all(j.verify(f"r{i}") for i in range(n)))
 
     def test_16_codec_is_lossless_and_strict(self):
         j = MemoryJournal()
@@ -352,7 +358,7 @@ class TestReplay(unittest.TestCase):
         run(loop.run(0, run_id="build.g1"))                # user id that looks like a generation
         r = run(loop.resume("build.g1", signals={"msg": "a"}))
         self.assertEqual(r.run_id, "build.g1.g1")
-        j.delete("build.g1.g1")                            # crash before next generation started
+        j.delete("build.g1.g1", chain=False)               # crash before next generation started
         r = run(loop.resume("build.g1", signals={"msg": "b"}))   # signals kept when following chain
         self.assertEqual((r.run_id, r.status), ("build.g1.g2", "suspended"))
         r = run(loop.resume("build.g1", signals={"msg": "c"}))
@@ -385,8 +391,8 @@ class TestReplay(unittest.TestCase):
             await ctx.step(lambda: log.append("creds"), name="creds", sensitive=True)
             await ctx.wait_for("done")
 
-        run(flow(v1, journal=j).run(run_id="r", signals={"go": 1}))
-        run(flow(v2, journal=j).resume("r", signals={"done": 1}))
+        run(flow(v1, journal=j, name="f").run(run_id="r", signals={"go": 1}))
+        run(flow(v2, journal=j, name="f").resume("r", signals={"done": 1}))
         self.assertNotIn("NEW", log)
 
     def test_14_worker_ignores_failures_the_flow_handled(self):
