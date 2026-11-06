@@ -1,0 +1,48 @@
+name: Bug report
+description: Something pylinxi did wrong (a step ran twice, a run didn't resume, a crash, ...)
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! The most useful bug reports include a small script that reproduces the problem.
+        For security issues, please don't open an issue — see SECURITY.md.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: A runnable script if possible (MemoryJournal or SQLiteJournal in a temp dir is ideal).
+      render: python
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output / traceback
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: pylinxi version
+      placeholder: "1.1.0"
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version and OS
+      placeholder: "3.12 on Ubuntu 24.04"
+    validations:
+      required: true
+  - type: dropdown
+    id: journal
+    attributes:
+      label: Journal
+      multiple: true
+      options: [MemoryJournal, FileJournal, SQLiteJournal, PostgresJournal, custom]
