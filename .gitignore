@@ -15,3 +15,4 @@ htmlcov/
 *.db-shm
 *.locks/
 .locks/
+site/
