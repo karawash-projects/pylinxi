@@ -45,7 +45,7 @@ jobs:
       - run: pip install -e ".[dev]"
       - name: full suite (Postgres + OpenTelemetry)
         run: python -W error::ResourceWarning -m unittest discover -s tests -t .
-      - run: python examples/support_agent.py && python examples/followup_agent.py
+      - run: for f in examples/*.py; do echo "== $f"; python "$f" || exit 1; done
 
   compat:
     # journals written by the previous release must load, verify and resume
