@@ -293,6 +293,8 @@ On certifications: SOC 2 / ISO 27001 apply to organizations and hosted services,
 
 ## Development
 
+Contributions are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md). Report security issues privately ([SECURITY.md](SECURITY.md)).
+
 ```bash
 git clone https://github.com/karawash-projects/pylinxi && cd pylinxi
 pip install -e ".[dev]"
