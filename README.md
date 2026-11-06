@@ -75,6 +75,13 @@ pip install "pylinxi[postgres,otel]"   # production extras
 
 ---
 
+## Examples
+
+Runnable, self-checking examples live in [`examples/`](examples/): an LLM agent with
+validation, prompt repair and model fallback; a checkout saga that survives a crash
+right after charging the card; a human approval workflow with escalation; and a
+scheduled job that runs indefinitely with `continue_as_new`.
+
 ## Self-healing
 
 ```python
