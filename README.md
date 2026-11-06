@@ -303,6 +303,8 @@ python examples/support_agent.py
 
 CI runs lint, type checks, and the full suite with a Postgres service on Python 3.9–3.13.
 
+See [ROADMAP.md](ROADMAP.md) for what's planned next.
+
 ### Releasing
 
 Bump `version` in `pyproject.toml` and `__version__` in `pylinxi/__init__.py`, add a `## X.Y.Z` section to `CHANGELOG.md`, then:
