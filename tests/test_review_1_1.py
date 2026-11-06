@@ -506,7 +506,7 @@ class TestP1(TmpDir):
         loads["n"] = 0
         r = run(mon.resume("m"))
         self.assertEqual((r.status, r.run_id), ("suspended", "m.g300"))
-        self.assertLessEqual(loads["n"], 3)
+        self.assertLessEqual(loads["n"], 4)        # + the previous generation, for stranded signals
 
     def test_18_replaced_task_factory_is_wrapped_again(self):
         delays = {"a": 0.03, "b": 0.0}
@@ -1866,6 +1866,187 @@ class TestReReview3(TmpDir):
         t = time.monotonic()
         self.assertEqual(run(f.run(run_id="r")).status, "suspended")
         self.assertLess(time.monotonic() - t, 0.9)
+
+
+
+class TestReview4(TmpDir):
+    """Fourth independent review (fixed in 1.1.1)."""
+
+    def test_r4_1_state_changed_in_place_while_a_write_is_pending(self):
+        for name, j in _journals(self.d):
+            charged = []
+
+            @step
+            def charge(i):
+                charged.append(i)
+                return i
+
+            @flow(journal=j, name="f")
+            async def f(ctx):
+                ctx.state["seen"] = {k: k for k in range(2000)}
+                stop = False
+
+                async def tracker():
+                    n = 2000
+                    while not stop:
+                        for _ in range(20):
+                            ctx.state["seen"][n] = n          # in-place, changes the dict's size
+                            ctx.state["seen"].pop(n - 50, None)
+                            n += 1
+                        await asyncio.sleep(0)
+                t = asyncio.ensure_future(tracker())
+                try:
+                    for i in range(15):
+                        await charge(i)
+                finally:
+                    stop = True
+                    await t
+                return "ok"
+
+            r = run(f.run(run_id="s"))
+            self.assertEqual((r.status, r.output), ("completed", "ok"), (name, r.error))
+            self.assertEqual(charged, list(range(15)), name)
+            j.close()
+
+    def test_r4_1b_patched_marker_then_in_place_state_change(self):
+        j = SQLiteJournal(f"{self.d}/j.db")
+
+        @step
+        def charge(i):
+            return i
+
+        @flow(journal=j)
+        async def f(ctx, n):
+            ctx.state["index"] = {}
+            await charge(0)
+            for k in range(n):
+                ctx.state["index"][k] = k            # in the delta of the marker below...
+            if ctx.patched("v2-reindex"):            # ...which is written by a writer thread
+                for k in range(n):
+                    ctx.state["index"][-k - 1] = k   # while flow code keeps changing the dict
+            await charge(1)
+            return "ok"
+
+        r = run(f.run(100_000, run_id="r"))
+        self.assertEqual(r.status, "completed", r.error)
+        self.assertTrue(j.verify("r"))
+
+    def test_r4_2_a_swallowed_strict_divergence_still_stops_the_run(self):
+        j = SQLiteJournal(f"{self.d}/j.db")
+        effects = []
+
+        @step
+        def a():
+            return "a"
+
+        @step
+        def b():
+            return "b"
+
+        @step
+        def charge():
+            effects.append("charge")
+            return 1
+
+        def make(v):
+            @flow(journal=j, name="div")
+            async def f(ctx):
+                async def branch():
+                    return await (a() if v == 1 else b())
+                await asyncio.gather(branch(), return_exceptions=True)
+                await ctx.wait_for("go")
+                return await charge()
+            return f
+
+        self.assertEqual(run(make(1).run(run_id="d")).status, "suspended")
+        r = run(make(2).resume("d", signals={"go": 1}))
+        self.assertEqual(r.status, "failed")
+        self.assertIsInstance(r.error, ReplayDivergence)
+        self.assertEqual(effects, [])
+
+    def test_r4_2b_suspension_swallowed_by_gather_is_reported(self):
+        events = []
+
+        @flow(journal=MemoryJournal())
+        async def f(ctx):
+            await asyncio.gather(ctx.wait_for("approval"), return_exceptions=True)
+            return "shipped"
+
+        with self.assertLogs("pylinxi", "WARNING"):
+            r = run(f.run(run_id="r", on_event=events.append))
+        self.assertEqual(r.status, "completed")
+        self.assertIn("suspension_ignored", [e["event"] for e in events])
+
+    def test_r4_3_signal_to_a_failed_run_follows_the_retry_rules(self):
+        j = SQLiteJournal(f"{self.d}/j.db")
+        charges = []
+
+        @step
+        def charge():
+            charges.append(1)
+            raise RuntimeError("declined")
+
+        @flow(journal=j)
+        async def f(ctx):
+            return await charge()
+
+        self.assertEqual(run(f.run(run_id="c")).status, "failed")
+        j.send_signal("c", "nudge", True)
+        w = Worker(j, [f])                       # retry_failed=False
+        for _ in range(3):
+            self.assertEqual(run(w.tick()).completed, [])
+        self.assertEqual(charges, [1])
+
+    def test_r4_4_signal_sent_during_continue_as_new_is_delivered(self):
+        class Racy(SQLiteJournal):
+            inject = True
+
+            def append(self, e):
+                if e.kind == "done" and self.inject:
+                    self.inject = False
+                    SQLiteJournal.send_signal(self, e.run_id, "msg", "late")
+                return super().append(e)
+
+        j = Racy(f"{self.d}/j.db")
+
+        @flow(journal=j)
+        async def chat(ctx, turn=0):
+            m = await ctx.wait_for("msg", timeout=3600)
+            if turn == 0:
+                ctx.continue_as_new(turn + 1)
+            return m
+
+        run(chat.run(0, run_id="c", signals={"msg": "first"}))
+        r = run(chat.resume("c"))
+        self.assertEqual((r.status, r.output), ("completed", "late"))
+        r = run(chat.resume("c"))                # forwarded exactly once
+        self.assertEqual(sum(1 for e in j.load("c.g1") if e.meta.get("forwarded_from")), 1)
+
+    def test_r4_5_steps_in_flight_when_the_drain_budget_ends_are_journaled(self):
+        sent = []
+
+        @step
+        async def send_email(i):
+            sent.append(i)
+            await asyncio.sleep(0.15)
+            return i
+
+        j = SQLiteJournal(f"{self.d}/j.db")
+
+        @flow(journal=j, drain_timeout=0.4)
+        async def f(ctx):
+            async def mailer():
+                for i in range(20):
+                    await send_email(i)
+            return await asyncio.gather(ctx.wait_for("go"), mailer())
+
+        self.assertEqual(run(f.run(run_id="r")).status, "suspended")
+        first = list(sent)
+        journaled = [e.key for e in j.load("r") if e.kind == "step"]
+        self.assertEqual(len(journaled), len(first))     # nothing that ran was left unjournaled
+        sent.clear()
+        run(f.resume("r"))
+        self.assertFalse(set(first) & set(sent))         # and nothing is sent twice
 
 
 if __name__ == "__main__":

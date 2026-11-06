@@ -17,6 +17,7 @@ on one machine): per-run locks make them skip runs another worker already owns.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import time
 from dataclasses import dataclass, field
@@ -130,8 +131,20 @@ class Worker:
                 if isinstance(wake, (int, float)) and wake <= now:
                     due.append(h.run_id)
             elif h.kind == "inbox":
-                due.append(h.run_id)                    # a signal arrived while it was suspended
-            elif h.kind == "failed" and h.key == "flow" and self.retry_failed:
+                # a signal arrived; what to do depends on where the run itself stands
+                try:
+                    last = next((e for e in reversed(self.journal.load(h.run_id)) if e.kind != "inbox"), None)
+                except Exception as e:  # noqa: BLE001 -- corrupt run: report, keep going
+                    report.errors[h.run_id] = repr(e)[:500]
+                    continue
+                if last is None or last.kind == "done" and not last.meta.get("continued_as"):
+                    continue                            # completed: nothing will consume it
+                if last.kind == "failed" and last.key == "flow":
+                    h = dataclasses.replace(h, kind="failed", key="flow")   # failed runs follow retry rules
+                else:
+                    due.append(h.run_id)                # suspended, or continued as a new generation
+                    continue
+            if h.kind == "failed" and h.key == "flow" and self.retry_failed:
                 if h.run_id in self._gave_up:
                     continue
                 try:

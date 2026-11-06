@@ -404,8 +404,17 @@ class Journal:
                 text = "[error text withheld: error_redactor failed]"
         return text
 
+    def prepared_delta(self, encoded: Dict[str, Any]) -> Dict[str, Any]:
+        """A delta built from already-encoded values (state keys -> Codec.encode trees):
+        redacted and decoded in one pass, into fresh objects that share nothing with the
+        caller's live state. Flows build deltas this way on the event loop thread, so a
+        write on a worker thread never touches objects flow code may still change."""
+        tree = redact(encoded, self.redact_pattern) if self.redact_pattern is not None else encoded
+        return {k: self.codec.decode(v) for k, v in tree.items()}
+
     def append(self, e: Entry) -> Entry:
-        e.delta = self.redact_value(e.delta)
+        if not getattr(e, "_prepared", False):        # see prepared_delta()
+            e.delta = self.redact_value(e.delta)
         e.meta = self.redact_value(e.meta)
         self._append_locked(e)
         return e
