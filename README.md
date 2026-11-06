@@ -2,6 +2,8 @@
 
 [![ci](https://github.com/karawash-projects/pylinxi/actions/workflows/ci.yml/badge.svg)](https://github.com/karawash-projects/pylinxi/actions/workflows/ci.yml)
 
+**[Documentation](https://karawash-projects.github.io/pylinxi/)** · [Examples](examples/) · [Changelog](CHANGELOG.md)
+
 Durable, self-healing agent flows written as **plain Python**. No graph to wire. The core has zero dependencies; Postgres and OpenTelemetry are optional extras. Python 3.9+.
 
 **Status: beta.** The API is stable within 1.x and journals stay readable across 1.x releases, but pylinxi is young: test it against your own failure modes before relying on it in production.

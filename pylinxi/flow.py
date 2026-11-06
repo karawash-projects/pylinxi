@@ -16,8 +16,9 @@ each get their own key scope ("t0/", "t1/", ...) assigned in creation order, so
 steps inside concurrent branches replay deterministically regardless of which
 branch finishes first. When one branch suspends, the others keep running (up to
 `drain_timeout`) until they also suspend or finish, and the run wakes at the
-earliest deadline among them. When a run fails or finishes, branches still running
-are cancelled before the run returns.
+earliest deadline among them. When a run fails or finishes while branches still
+run, steps already executing finish and are journaled (bounded by `drain_timeout`),
+no new step starts, and the remaining branches are cancelled before the run returns.
 """
 from __future__ import annotations
 
@@ -901,9 +902,13 @@ class Context:
     def patched(self, change_id: str) -> bool:
         """Safely change flow code while runs are in flight.
 
-            if ctx.patched("v2-extra-check"):
-                await new_check()        # runs that reach this point on new code
-            # runs already past this point keep the old behaviour on replay
+        Returns True for runs that reach this point on the new code, False for runs
+        that were already past it (they keep their old behaviour on replay):
+
+        ```python
+        if ctx.patched("v2-extra-check"):
+            await new_check()
+        ```
         """
         key = f"patch:{change_id}"
         self._note_progress(self._scope_now().prefix)
