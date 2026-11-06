@@ -4,15 +4,24 @@
     pylinxi runs --status failed            # journal from $PYLINXI_JOURNAL
     pylinxi show ticket-1001
     pylinxi state ticket-1001 --seq 3       # time travel
-    pylinxi verify --all --require-signed   # exit code 1 on any failure (CI / audits)
+    pylinxi verify --all                    # exit code 1 on any failure (CI / audits)
     pylinxi timers --due
-    pylinxi delete ticket-1001 --yes
+    pylinxi delete ticket-1001 --yes        # the run and every continue-as-new generation
 
-Signing keys come from --key kid=secret (repeatable) or $PYLINXI_KEYS="k1=...,k2=...".
+Signing keys (needed to verify signed journals) come from, in order:
+  --key-file PATH or $PYLINXI_KEYS_FILE   one `kid=secret` per line, or a JSON object
+  $PYLINXI_KEYS                           `kid=secret` pairs separated by commas or newlines
+  --key kid=secret                        works, but is visible in process listings
+A secret may be written as `hex:...` or `base64:...` for binary keys or keys
+containing commas. When keys are given, `verify` also requires every entry to be
+signed (pass --allow-unsigned while migrating an old unsigned journal).
+The CLI never creates journals: a mistyped path is an error, not an empty journal.
 """
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import datetime as _dt
 import json
 import os
@@ -20,16 +29,57 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence
 
-from .journal import Entry, Journal, JournalCorrupt, open_journal
+from .journal import Entry, Journal, JournalCorrupt, RunLocked, open_journal
+
+
+def _secret(value: str) -> bytes:
+    try:
+        if value.startswith("hex:"):
+            return bytes.fromhex(value[4:])
+        if value.startswith("base64:"):
+            return base64.b64decode(value[7:], validate=True)
+    except (ValueError, binascii.Error) as e:
+        raise SystemExit(f"bad key encoding: {e}") from None
+    return value.encode()
 
 
 def _parse_keys(pairs: Sequence[str]) -> Dict[str, bytes]:
     keys: Dict[str, bytes] = {}
     for p in pairs:
+        p = p.strip()
+        if not p or p.startswith("#"):
+            continue
         if "=" not in p:
-            raise SystemExit(f"bad key {p!r}: expected kid=secret")
+            raise SystemExit(f"bad key {p[:12]!r}...: expected kid=secret")
         kid, secret = p.split("=", 1)
-        keys[kid.strip()] = secret.encode()
+        keys[kid.strip()] = _secret(secret.strip())
+    return keys
+
+
+def _load_keys(args: argparse.Namespace) -> Dict[str, bytes]:
+    keys: Dict[str, bytes] = {}
+    path = args.key_file or os.environ.get("PYLINXI_KEYS_FILE")
+    if path:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read()
+        except OSError as e:
+            raise SystemExit(f"cannot read key file: {e}") from None
+        try:
+            obj = json.loads(text)
+        except ValueError:
+            obj = None
+        if isinstance(obj, dict):
+            keys.update({str(k): _secret(str(v)) for k, v in obj.items()})
+        else:
+            keys.update(_parse_keys(text.splitlines()))
+    env = os.environ.get("PYLINXI_KEYS", "")
+    if env:
+        keys.update(_parse_keys(env.replace("\n", ",").replace("\r", "").split(",")))
+    if args.key:
+        print("pylinxi: warning: --key puts the secret in your shell history and process listings; "
+              "prefer --key-file or $PYLINXI_KEYS", file=sys.stderr)
+        keys.update(_parse_keys(args.key))
     return keys
 
 
@@ -37,9 +87,10 @@ def run_status(entries: List[Entry]) -> str:
     """completed | continued | failed | sleeping (timer) | waiting (signal) | open (running or crashed)"""
     if not entries:
         return "missing"
+    done = next((e for e in entries if e.kind == "done"), None)
+    if done is not None:
+        return "continued" if done.meta.get("continued_as") else "completed"
     last = entries[-1]
-    if last.kind == "done":
-        return "continued" if last.meta.get("continued_as") else "completed"
     if last.kind == "failed" and last.key == "flow":
         return "failed"
     if last.kind == "suspend":
@@ -109,10 +160,15 @@ def cmd_show(j: Journal, args: argparse.Namespace) -> int:
 
 
 def cmd_state(j: Journal, args: argparse.Namespace) -> int:
-    if not j.load(args.run_id):
-        print(f"run {args.run_id!r} not found", file=sys.stderr)
+    try:
+        if not j.load(args.run_id):
+            print(f"run {args.run_id!r} not found", file=sys.stderr)
+            return 1
+        state = j.state_at(args.run_id, args.seq)
+    except JournalCorrupt as e:
+        print(f"run {args.run_id!r} is corrupt: {e}", file=sys.stderr)
         return 1
-    print(json.dumps(j.state_at(args.run_id, args.seq), indent=2, default=str))
+    print(json.dumps(state, indent=2, default=str))
     return 0
 
 
@@ -121,7 +177,8 @@ def cmd_verify(j: Journal, args: argparse.Namespace) -> int:
     if not ids:
         print("nothing to verify (give run ids or --all)", file=sys.stderr)
         return 2
-    results = {rid: j.verify(rid, require_signed=args.require_signed) for rid in ids}
+    require = args.require_signed or (bool(j.keys) and not args.allow_unsigned)
+    results = {rid: j.verify(rid, require_signed=require) for rid in ids}
     bad = [r for r, ok in results.items() if not ok]
     _out(args, results, "\n".join(f"{'OK  ' if ok else 'FAIL'}  {rid}" for rid, ok in results.items())
          + f"\n\n{len(ids) - len(bad)}/{len(ids)} verified")
@@ -141,10 +198,20 @@ def cmd_delete(j: Journal, args: argparse.Namespace) -> int:
     if not args.yes:
         print("refusing to delete without --yes (this is permanent)", file=sys.stderr)
         return 2
+    code = 0
     for rid in args.run_ids:
-        j.delete(rid)
-        print(f"deleted {rid}")
-    return 0
+        try:
+            gone = j.delete(rid, chain=not args.only)
+        except RunLocked as e:
+            print(f"not deleted: {e}", file=sys.stderr)
+            code = 1
+            continue
+        if not gone:
+            print(f"run {rid!r} not found", file=sys.stderr)
+            code = 1
+        for g in gone:
+            print(f"deleted {g}")
+    return code
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -152,8 +219,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--journal", default=os.environ.get("PYLINXI_JOURNAL"),
                    help="journal URL (memory://, file://DIR, sqlite:///FILE, postgresql://...); "
                         "default $PYLINXI_JOURNAL")
+    p.add_argument("--key-file", metavar="PATH", help="file of kid=secret lines or a JSON object; "
+                                                         "default $PYLINXI_KEYS_FILE")
     p.add_argument("--key", action="append", default=[], metavar="KID=SECRET",
-                   help="signing key for verify (repeatable); default $PYLINXI_KEYS")
+                   help="signing key (repeatable; visible in process listings, prefer --key-file)")
     p.add_argument("--json", action="store_true", help="machine-readable output")
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -174,15 +243,17 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("verify", help="verify hash chain and signatures")
     s.add_argument("run_ids", nargs="*")
     s.add_argument("--all", action="store_true")
-    s.add_argument("--require-signed", action="store_true")
+    s.add_argument("--require-signed", action="store_true", help="fail unsigned entries even without keys")
+    s.add_argument("--allow-unsigned", action="store_true", help="accept unsigned entries although keys are set")
     s.set_defaults(fn=cmd_verify)
 
     s = sub.add_parser("timers", help="list runs waiting on timers")
     s.add_argument("--due", action="store_true", help="only timers that are due now")
     s.set_defaults(fn=cmd_timers)
 
-    s = sub.add_parser("delete", help="permanently delete runs")
+    s = sub.add_parser("delete", help="permanently delete runs (with all continue-as-new generations)")
     s.add_argument("run_ids", nargs="+")
+    s.add_argument("--only", action="store_true", help="delete just the named generation")
     s.add_argument("--yes", action="store_true")
     s.set_defaults(fn=cmd_delete)
     return p
@@ -193,8 +264,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not args.journal:
         print("no journal: pass --journal URL or set PYLINXI_JOURNAL", file=sys.stderr)
         return 2
-    keys = _parse_keys(args.key or [k for k in os.environ.get("PYLINXI_KEYS", "").split(",") if k])
-    with open_journal(args.journal, secret=keys or None) as j:
+    keys = _load_keys(args)
+    try:
+        j = open_journal(args.journal, create=False, secret=keys or None, verify_on_load=False)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"pylinxi: {e}", file=sys.stderr)
+        return 2
+    with j:
         return int(args.fn(j, args))
 
 

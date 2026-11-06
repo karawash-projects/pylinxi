@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pylinxi"
-version = "1.0.0"
+version = "1.1.0"
 description = "Durable, self-healing agent flows as plain Python. Zero dependencies."
 readme = "README.md"
 license = "MIT"

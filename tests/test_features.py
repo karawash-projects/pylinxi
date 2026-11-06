@@ -188,7 +188,8 @@ class TestEvolution(unittest.TestCase):
             await ctx.wait_for("finish")
             return [a, b, extra]
 
-        old, new = flow(v1, journal=j), flow(v2, journal=j)
+        # the same flow before and after a deploy: a stable name keeps its identity
+        old, new = flow(v1, journal=j, name="checkout"), flow(v2, journal=j, name="checkout")
         run(old.run(run_id="before_point"))                    # suspended at "go"
         run(old.run(run_id="past_point", signals={"go": 1}))   # already ran b, suspended at "finish"
 
@@ -219,7 +220,8 @@ class TestEvolution(unittest.TestCase):
         self.assertEqual((r.output, r.run_id), (9, "loop.g2"))
         self.assertEqual(r.state["total"], 9)
         self.assertEqual(sorted(j.runs()), ["loop", "loop.g1", "loop.g2"])
-        self.assertTrue(all(len(j.load(x)) <= 6 for x in j.runs()))
+        # each generation stays short; the root also keeps one link per later generation
+        self.assertTrue(all(len([e for e in j.load(x) if e.kind != "link"]) <= 6 for x in j.runs()))
         again = run(counter.resume("loop"))           # resuming the root follows the chain
         self.assertEqual((again.output, again.run_id), (9, "loop.g2"))
 

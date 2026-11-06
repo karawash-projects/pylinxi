@@ -47,9 +47,24 @@ jobs:
         run: python -W error::ResourceWarning -m unittest discover -s tests -t .
       - run: python examples/support_agent.py && python examples/followup_agent.py
 
+  compat:
+    # journals written by the previous release must load, verify and resume
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: write journals with pylinxi 1.0.0 from PyPI
+        run: |
+          python -m venv /tmp/prev && /tmp/prev/bin/pip install "pylinxi==1.0.0"
+          mkdir -p /tmp/journals && cd /tmp && /tmp/prev/bin/python $GITHUB_WORKSPACE/tests/compat/write_journals.py /tmp/journals
+      - name: read them with this version
+        run: PYTHONPATH=$GITHUB_WORKSPACE python tests/compat/read_journals.py /tmp/journals
+
   build:
     runs-on: ubuntu-latest
-    needs: [lint, test]
+    needs: [lint, test, compat]
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6

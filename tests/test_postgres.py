@@ -20,10 +20,14 @@ DSN = os.environ.get("PYLINXI_PG_DSN")
 class TestPostgresJournal(unittest.TestCase):
     def setUp(self):
         self.table = f"pylinxi_test_{uuid.uuid4().hex[:8]}"
-        self.j = PostgresJournal(DSN, table=self.table, secret=b"k")
+        self.app = f"pylinxi-test-{self.table}"            # isolates this test's connections
+        sep = "&" if "?" in DSN else "?"
+        self.dsn = f"{DSN}{sep}application_name={self.app}"
+        self.j = PostgresJournal(self.dsn, table=self.table, secret=b"k")
 
     def tearDown(self):
         self.j._conn.execute(f"DROP TABLE {self.table}")
+        self.j._conn.execute(f"DROP TABLE IF EXISTS {self.table}_heads")
         self.j.close()
 
     def test_crash_and_resume_from_a_fresh_worker(self):
@@ -61,6 +65,8 @@ class TestPostgresJournal(unittest.TestCase):
         self.assertNotIn("hunter2", raw)
 
     def test_concurrent_writers_keep_chain_linear(self):
+        self.j.append(Entry("shared", "start", "start", {}))   # a run's first entry is its start
+
         def writer(i):
             j = PostgresJournal(DSN, table=self.table, secret=b"k")
             for n in range(25):
@@ -73,7 +79,7 @@ class TestPostgresJournal(unittest.TestCase):
         for t in threads:
             t.join()
         entries = self.j.load("shared")
-        self.assertEqual([e.seq for e in entries], list(range(100)))
+        self.assertEqual([e.seq for e in entries], list(range(101)))
         self.assertTrue(self.j.verify("shared"))
 
     def test_second_worker_cannot_run_same_run(self):
@@ -112,10 +118,107 @@ class TestPostgresJournal(unittest.TestCase):
     def test_execution_lock_never_blocks_other_runs_appends(self):
         # review #21: run "X:w" used the same lock key as run "X"'s appends
         import time
+        self.j.append(Entry("acct", "start", "start", {}))
         with self.j.lock("acct:w"):
             t = time.perf_counter()
             self.j.append(Entry("acct", "a#0", "step", 1))
             self.assertLess(time.perf_counter() - t, 0.5)
+
+    def _admin(self):
+        import psycopg
+        return psycopg.connect(DSN, autocommit=True)
+
+    def test_lost_lock_fences_the_old_worker(self):
+        # review #11: a worker whose lock connection drops must not keep writing
+        import threading
+
+        from pylinxi import LockLost
+        effects, entered = [], threading.Event()
+        admin = self._admin()
+
+        def make(j, who):
+            @flow(journal=j, name="f")
+            async def f(ctx):
+                def charge():
+                    entered.set()
+                    if who == "w1":
+                        import time
+                        time.sleep(0.6)
+                    effects.append(who)
+                await ctx.step(charge, name="charge")
+                return who
+            return f
+
+        # a second worker process (a distinct connection string = a distinct in-process lock namespace)
+        sep = "&" if "?" in DSN else "?"
+        j2 = PostgresJournal(DSN + f"{sep}application_name=worker2", table=self.table, secret=b"k")
+
+        async def main():
+            t1 = asyncio.ensure_future(make(self.j, "w1").run(run_id="r"))
+            while not entered.is_set():
+                await asyncio.sleep(0.01)
+            with self.assertRaises(RunLocked):
+                await make(j2, "w2").run(run_id="r")
+            admin.execute("SELECT pg_terminate_backend(l.pid) FROM pg_locks l JOIN pg_stat_activity a "
+                          "ON a.pid = l.pid WHERE l.locktype='advisory' AND l.granted AND a.application_name=%s",
+                          (self.app,))
+            await asyncio.sleep(0.1)
+            r2 = await make(j2, "w2").run(run_id="r")
+            with self.assertRaises(LockLost):
+                await t1
+            return r2
+        r2 = asyncio.run(main())
+        self.assertEqual(r2.output, "w2")
+        ks = [(e.kind, e.key) for e in j2.load("r")]
+        self.assertEqual(ks.count(("step", "charge#0")), 1)   # w1 could not journal after losing its lock
+        self.assertEqual(ks.count(("done", "done")), 1)
+        self.assertTrue(j2.verify("r", require_signed=True))
+        j2.close()
+        admin.close()
+
+    def test_connections_stay_bounded_and_shared_connection_reconnects(self):
+        # review #28
+        admin = self._admin()
+
+        @flow(journal=self.j)
+        async def f(ctx, i):
+            await ctx.step(lambda: __import__("time").sleep(0.05), name="w")
+            return i
+
+        def conns():
+            return admin.execute("SELECT count(*) FROM pg_stat_activity WHERE application_name=%s",
+                                 (self.app,)).fetchone()[0]
+        base = conns()
+        peak = {"n": 0}
+
+        async def main():
+            tasks = [asyncio.ensure_future(f.run(i, run_id=f"c{i}")) for i in range(40)]
+            while not all(t.done() for t in tasks):
+                peak["n"] = max(peak["n"], conns())
+                await asyncio.sleep(0.01)
+            return [t.result().output for t in tasks]
+        self.assertEqual(asyncio.run(main()), list(range(40)))
+        self.assertLessEqual(peak["n"] - base, self.j.lock_connections)
+        pid = self.j._conn.info.backend_pid
+        admin.execute("SELECT pg_terminate_backend(%s)", (pid,))
+        self.assertEqual(len(list(self.j.runs())), 40)          # reconnected transparently
+        admin.close()
+
+    def test_heads_index_and_worker_on_postgres(self):
+        from pylinxi import Worker
+
+        @flow(journal=self.j)
+        async def f(ctx):
+            await ctx.sleep(0.5, inline_max=0)
+            return "woke"
+
+        asyncio.run(f.run(run_id="h1"))
+        import time
+        self.assertEqual(self.j.pending_timers(due_before=time.time()), [])
+        time.sleep(0.6)
+        self.assertEqual([r for r, _ in self.j.pending_timers(due_before=time.time())], ["h1"])
+        self.assertEqual(asyncio.run(Worker(self.j, [f]).tick()).completed, ["h1"])
+        self.assertEqual(self.j.pending_timers(), [])
 
     def test_tamper_detected_in_database(self):
         @flow(journal=self.j)
