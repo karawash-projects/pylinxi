@@ -31,7 +31,16 @@ from .journal import (
     open_journal,
     redact,
 )
-from .policy import AttemptStillRunning, CircuitBreaker, CircuitOpen, Policy, Retry, StepFailed, ValidationError
+from .policy import (
+    AttemptStillRunning,
+    CircuitBreaker,
+    CircuitOpen,
+    Policy,
+    PriorAttemptRunning,
+    Retry,
+    StepFailed,
+    ValidationError,
+)
 from .worker import TickReport, Worker
 
 __version__ = "1.1.0"
@@ -39,6 +48,7 @@ __all__ = [
     "flow", "step", "idempotency_key", "Flow", "Context", "RunResult", "Suspended", "ContinueAsNew",
     "ReplayedError", "ReplayDivergence", "ResultNotJournaled", "FlowMismatch", "RunExists",
     "Policy", "Retry", "CircuitBreaker", "CircuitOpen", "StepFailed", "ValidationError", "AttemptStillRunning",
+    "PriorAttemptRunning",
     "Journal", "MemoryJournal", "FileJournal", "SQLiteJournal", "RunLocked", "LockLost", "JournalCorrupt",
     "UnknownRun", "Entry", "Head", "SCHEMA_VERSION",
     "Codec", "default_codec", "open_journal", "redact", "Worker", "TickReport",

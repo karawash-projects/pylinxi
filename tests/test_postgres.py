@@ -20,7 +20,10 @@ DSN = os.environ.get("PYLINXI_PG_DSN")
 class TestPostgresJournal(unittest.TestCase):
     def setUp(self):
         self.table = f"pylinxi_test_{uuid.uuid4().hex[:8]}"
-        self.j = PostgresJournal(DSN, table=self.table, secret=b"k")
+        self.app = f"pylinxi-test-{self.table}"            # isolates this test's connections
+        sep = "&" if "?" in DSN else "?"
+        self.dsn = f"{DSN}{sep}application_name={self.app}"
+        self.j = PostgresJournal(self.dsn, table=self.table, secret=b"k")
 
     def tearDown(self):
         self.j._conn.execute(f"DROP TABLE {self.table}")
@@ -156,8 +159,9 @@ class TestPostgresJournal(unittest.TestCase):
                 await asyncio.sleep(0.01)
             with self.assertRaises(RunLocked):
                 await make(j2, "w2").run(run_id="r")
-            admin.execute("SELECT pg_terminate_backend(pid) FROM pg_locks WHERE locktype='advisory' "
-                          "AND granted AND pid <> pg_backend_pid()")
+            admin.execute("SELECT pg_terminate_backend(l.pid) FROM pg_locks l JOIN pg_stat_activity a "
+                          "ON a.pid = l.pid WHERE l.locktype='advisory' AND l.granted AND a.application_name=%s",
+                          (self.app,))
             await asyncio.sleep(0.1)
             r2 = await make(j2, "w2").run(run_id="r")
             with self.assertRaises(LockLost):
@@ -182,8 +186,8 @@ class TestPostgresJournal(unittest.TestCase):
             return i
 
         def conns():
-            return admin.execute("SELECT count(*) FROM pg_stat_activity WHERE backend_type='client backend' "
-                                 "AND pid <> pg_backend_pid()").fetchone()[0]
+            return admin.execute("SELECT count(*) FROM pg_stat_activity WHERE application_name=%s",
+                                 (self.app,)).fetchone()[0]
         base = conns()
         peak = {"n": 0}
 
@@ -205,12 +209,13 @@ class TestPostgresJournal(unittest.TestCase):
 
         @flow(journal=self.j)
         async def f(ctx):
-            await ctx.sleep(0.01, inline_max=0)
+            await ctx.sleep(0.5, inline_max=0)
             return "woke"
 
         asyncio.run(f.run(run_id="h1"))
         import time
-        time.sleep(0.02)
+        self.assertEqual(self.j.pending_timers(due_before=time.time()), [])
+        time.sleep(0.6)
         self.assertEqual([r for r, _ in self.j.pending_timers(due_before=time.time())], ["h1"])
         self.assertEqual(asyncio.run(Worker(self.j, [f]).tick()).completed, ["h1"])
         self.assertEqual(self.j.pending_timers(), [])

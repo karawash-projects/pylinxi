@@ -769,7 +769,7 @@ class FileJournal(Journal):
         if not isinstance(run_id, str) or not run_id:
             raise ValueError("run_id must be a non-empty string")
         cached = self._paths.get(run_id)
-        if cached is not None:
+        if cached is not None and cached.exists():    # re-resolved if another instance moved/deleted it
             return cached
         slug = re.sub(r"[^a-z0-9_.-]+", "-", run_id.lower()).strip(".-")[:40] or "run"
         hashed = self.dir / f"{slug}~{hashlib.sha256(run_id.encode()).hexdigest()[:24]}.jsonl"
@@ -788,14 +788,21 @@ class FileJournal(Journal):
                     path = plain
             elif safe:
                 path = plain
-        self._paths[run_id] = path
+        if path.exists():                               # only settled names are cached
+            if len(self._paths) >= 4096:
+                self._paths.clear()
+            self._paths[run_id] = path
         return path
 
     def _lock_ns(self) -> str:
         return f"file:{self.dir.resolve()}"
 
     def _lock_file(self, run_id: str) -> Optional[Path]:
-        return self.dir / ".locks" / f"{self._path(run_id).stem}.lock"
+        # named after the run id itself, not its storage file, so every instance and
+        # process agrees on it whatever file name they resolved
+        if not isinstance(run_id, str) or not run_id:
+            raise ValueError("run_id must be a non-empty string")
+        return self.dir / ".locks" / f"{hashlib.sha256(run_id.encode()).hexdigest()[:32]}.lock"
 
     @staticmethod
     def _valid_record(line: bytes) -> bool:

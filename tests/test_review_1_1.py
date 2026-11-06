@@ -1068,8 +1068,6 @@ class TestMinor(TmpDir):
         self.assertEqual([k for kd, k in kinds(f.journal, "r") if kd == "step"], ["fetch#0", "fetch#1"])
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 # ======================================================================== re-review of the 1.1 fixes
@@ -1369,3 +1367,307 @@ class TestReReview(TmpDir):
         run(flow(v1, journal=j, name="f").run(run_id="r"))
         r = run(flow(v2, journal=j, name="f").resume("r", signals={"go": 1}))
         self.assertIsInstance(r.error, ReplayDivergence)
+
+    def test_rr_load_abandoned_results_never_cross_journals_or_incarnations(self):
+        # found under CPU load: a late result abandoned by one journal's run "r" was handed
+        # to another journal's run "r" with the same step key
+        @step(policy=Policy(timeout=0.02))
+        def charge():
+            time.sleep(0.1)
+            return "late"
+
+        j1 = MemoryJournal()
+
+        @flow(journal=j1)
+        async def a(ctx):
+            return await charge()
+
+        run(a.run(run_id="r"))                        # times out, its thread finishes later
+        time.sleep(0.15)
+        j2 = MemoryJournal()
+
+        @flow(journal=j2)
+        async def b(ctx):
+            return await ctx.step(lambda: "fresh", name="charge")
+
+        self.assertEqual(run(b.run(run_id="r")).output, "fresh")
+        j1.delete("r")                                # same journal, new incarnation of "r"
+        self.assertEqual(run(flow(b.fn, journal=j1, name="a").run(run_id="r")).output, "fresh")
+
+
+class TestReReview2(TmpDir):
+    """Second re-review: bugs introduced or left by the first round of fixes (N1-N7)."""
+
+    def test_n1_siblings_that_finished_after_a_failure_are_not_rerun(self):
+        from collections import Counter
+        for use_map in (True, False):
+            n = Counter()
+
+            @step
+            async def charge(item):
+                n[item] += 1
+                if item == "A" and n[item] == 1:
+                    await asyncio.sleep(0.01)
+                    raise RuntimeError("A declined")
+                if item == "B":
+                    await asyncio.sleep(0.05)        # finishes after A failed
+                return f"charged {item}"
+
+            @step
+            async def release():
+                n["release"] += 1
+                return True
+
+            @flow(journal=SQLiteJournal(f"{self.d}/n1{use_map}.db"), name="f")
+            async def f(ctx):
+                try:
+                    if use_map:
+                        return await ctx.map(charge, ["A", "B"])
+                    return await asyncio.gather(charge("A"), charge("B"))
+                finally:
+                    await release()
+
+            self.assertEqual(run(f.run(run_id="r")).status, "failed")
+            r = run(f.resume("r"))
+            self.assertEqual(r.output, ["charged A", "charged B"])
+            self.assertEqual(dict(n), {"A": 2, "B": 1, "release": 1}, use_map)
+
+    def test_n2_progress_made_while_a_branch_failure_was_pending_is_not_rerun(self):
+        from collections import Counter
+        n = Counter()
+        boom = {"on": True}
+
+        @step
+        async def charge():
+            n["charge"] += 1
+            await asyncio.sleep(0.01)
+            if boom["on"]:
+                raise RuntimeError("declined")
+            return "ok"
+
+        @step
+        def ship():
+            n["ship"] += 1
+            return "shipped"
+
+        @flow(journal=SQLiteJournal(f"{self.d}/n2.db"))
+        async def f(ctx):
+            t = asyncio.ensure_future(charge())
+            shipped = await ship()
+            await asyncio.sleep(0.05)
+            return await t, shipped
+
+        self.assertEqual(run(f.run(run_id="r")).status, "failed")
+        boom["on"] = False
+        self.assertEqual(run(f.resume("r")).output, ("ok", "shipped"))
+        self.assertEqual(dict(n), {"charge": 2, "ship": 1})
+
+    def test_n7_cleanup_reached_again_after_a_successful_retry_replays(self):
+        from collections import Counter
+        n = Counter()
+
+        @step
+        def charge():
+            n["charge"] += 1
+            if n["charge"] == 1:
+                raise RuntimeError("down")
+            return "ch_1"
+
+        @step
+        def email():
+            n["email"] += 1
+            return True
+
+        for name, j in _journals(self.d):
+            n.clear()
+
+            @flow(journal=j, name="f")
+            async def f(ctx):
+                try:
+                    return await charge()
+                finally:
+                    await email()
+
+            self.assertEqual(run(f.run(run_id="r")).status, "failed", name)
+            r = run(f.resume("r"))
+            self.assertEqual((r.status, r.output), ("completed", "ch_1"), name)
+            self.assertEqual(dict(n), {"charge": 2, "email": 1}, name)
+            j.close()
+
+    def test_n1_retry_after_cleanup_still_takes_another_path(self):
+        """The case the superseding was introduced for (first re-review #2) still works."""
+        calls = []
+        boom = {"on": True}
+
+        @step
+        def charge():
+            calls.append("charge")
+            if boom["on"]:
+                raise RuntimeError("down")
+            return 1
+
+        @step
+        def notify(what):
+            calls.append(what)
+            return what
+
+        j = SQLiteJournal(f"{self.d}/j.db")
+
+        @flow(journal=j)
+        async def f(ctx):
+            try:
+                await charge()
+            except StepFailed:
+                await notify("failed")
+                raise
+            return await notify("shipped")
+
+        self.assertEqual(run(f.run(run_id="r")).status, "failed")
+        boom["on"] = False
+        r = run(f.resume("r"))
+        self.assertEqual((r.status, r.output), ("completed", "shipped"))
+        self.assertEqual(calls, ["charge", "failed", "charge", "shipped"])
+
+    def test_n3_taskgroup_sibling_inside_a_step_still_records_its_deadline(self):
+        if sys.version_info < (3, 11):
+            self.skipTest("TaskGroup needs Python 3.11")
+        calls = []
+
+        @step
+        async def prep():
+            calls.append(1)
+            await asyncio.sleep(0.1)
+            return 1
+
+        for name, j in _journals(self.d):
+            calls.clear()
+
+            @flow(journal=j)
+            async def f(ctx):
+                async def reminder():
+                    await prep()
+                    await ctx.sleep(600)
+
+                async with asyncio.TaskGroup() as tg:
+                    t = tg.create_task(ctx.wait_for("go"))
+                    tg.create_task(reminder())
+                return t.result()
+
+            r = run(f.run(run_id="t"))
+            self.assertEqual(r.status, "suspended", name)
+            self.assertAlmostEqual(r.wake_at - time.time(), 600, delta=5, msg=name)
+            self.assertEqual(calls, [1], name)
+            j.close()
+
+    def test_n4_resume_while_an_earlier_attempt_runs_waits_instead_of_failing(self):
+        from pylinxi import policy as pol
+        old = pol.PRIOR_ATTEMPT_WAIT
+        pol.PRIOR_ATTEMPT_WAIT = 0.2
+        try:
+            done = []
+
+            @step
+            def report():
+                time.sleep(1.0)
+                done.append(1)
+                return "report.csv"
+
+            j = SQLiteJournal(f"{self.d}/j.db")
+
+            @flow(journal=j, drain_timeout=0.1)
+            async def f(ctx):
+                async def gen():
+                    try:
+                        return await report()
+                    except StepFailed as e:
+                        return f"FAILED: {e.error!r}"
+                return await asyncio.gather(ctx.wait_for("go"), gen())
+
+            async def go():
+                r = await f.run(run_id="r")
+                self.assertEqual(r.status, "suspended")
+                r = await f.resume("r", signals={"go": 1})
+                while r.status == "suspended":
+                    self.assertIsNotNone(r.wake_at)
+                    await asyncio.sleep(max(0.0, r.wake_at - time.time()))
+                    r = await f.resume("r")
+                return r
+            r = run(go())
+            self.assertEqual((r.status, r.output), ("completed", [1, "report.csv"]))
+            self.assertEqual(done, [1])
+            self.assertEqual([e.key for e in j.load("r") if e.kind == "marker"], [])
+        finally:
+            pol.PRIOR_ATTEMPT_WAIT = old
+
+    def test_n5_a_slow_run_does_not_stall_other_runs_writes(self):
+        slow_runs = {"slow"}
+
+        class Slow(SQLiteJournal):
+            def append(self, e):
+                if e.run_id in slow_runs and e.kind == "step":
+                    time.sleep(0.03)
+                return super().append(e)
+
+        j = Slow(f"{self.d}/j.db")
+
+        @flow(journal=j, name="f")
+        async def f(ctx, n):
+            return await asyncio.gather(*(ctx.step(lambda: 1, name="s") for _ in range(n)))
+
+        async def go():
+            slow = asyncio.ensure_future(f.run(60, run_id="slow"))
+            await asyncio.sleep(0.1)
+            t = time.perf_counter()
+            r = await f.run(1, run_id="fast")
+            took = time.perf_counter() - t
+            await slow
+            return r, took
+        r, took = run(go())
+        self.assertEqual(r.status, "completed")
+        self.assertLess(took, 0.5)
+
+    def test_n5_a_failed_write_stops_later_writes_of_that_run(self):
+        from pylinxi.flow import Context
+
+        class Flaky(MemoryJournal):
+            blocking = True
+
+            def append(self, e):
+                if e.key == "b":
+                    time.sleep(0.05)
+                    raise OSError("disk full")
+                return super().append(e)
+
+        j = Flaky()
+        j.append(Entry("r", "start", "start", {}))
+        ctx = Context("r", j, {}, j.load("r"), lambda *a, **k: None)
+        futs = [ctx._submit(Entry("r", k, "step", 1)) for k in ("a", "b", "c")]
+        concurrent_wait = __import__("concurrent.futures").futures.wait
+        concurrent_wait(futs, timeout=5)
+        self.assertIsNone(futs[0].exception())
+        self.assertIsInstance(futs[1].exception(), OSError)
+        self.assertIsInstance(futs[2].exception(), OSError)
+        self.assertEqual([e.key for e in j.load("r")], ["start", "a"])
+
+    def test_n6_file_journal_instances_agree_on_files_and_locks(self):
+        a, b = FileJournal(self.d), FileJournal(self.d)
+
+        @flow(journal=a, name="f")
+        async def fa(ctx, x):
+            return x
+
+        fb = flow(fa.fn, journal=b, name="f")
+        run(fa.run("old", run_id="Order-1"))
+        self.assertEqual(a._lock_file("Order-1"), b._lock_file("Order-1"))
+        self.assertEqual(a._lock_file("Order-1"), FileJournal(self.d)._lock_file("Order-1"))
+        b.delete("Order-1")
+        self.assertEqual(run(fb.run("new", run_id="Order-1")).output, "new")
+        self.assertEqual(run(fa.resume("Order-1")).output, "new")     # A sees B's re-created run
+        with a.lock("Order-1"):
+            with self.assertRaises(RunLocked):
+                with FileJournal(self.d).lock("Order-1"):
+                    pass
+
+
+if __name__ == "__main__":
+    unittest.main()

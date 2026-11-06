@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import builtins
 import concurrent.futures
+import contextlib
 import contextvars
 import functools
 import inspect
@@ -41,6 +42,7 @@ from typing import (
     Callable,
     Dict,
     Iterable,
+    Iterator,
     List,
     Mapping,
     Optional,
@@ -51,7 +53,7 @@ from typing import (
 )
 
 from .journal import Entry, Journal, MemoryJournal, RunLocked, UnknownRun, find_secret_keys
-from .policy import Policy, StepFailed, run_with_policy
+from .policy import Policy, PriorAttemptRunning, StepFailed, run_with_policy
 
 log = logging.getLogger("pylinxi")
 
@@ -152,18 +154,19 @@ def step(fn: Optional[Callable] = None, *, policy: Optional[Policy] = None,
 
 # ---------------------------------------------------------------- scopes & task tracking
 class _Scope:
-    __slots__ = ("prefix", "ctx", "counters", "children", "total")
+    __slots__ = ("prefix", "ctx", "counters", "children", "total", "err")
 
-    def __init__(self, prefix: str, ctx: Context):
+    def __init__(self, prefix: str, ctx: Context, err: frozenset = frozenset()):
         self.prefix, self.ctx = prefix, ctx
         self.counters: Dict[str, int] = {}
         self.children = 0
         self.total = 0          # keys allocated in this scope so far (allocation index)
+        self.err = err          # step failures being handled where this branch was created
 
     def child(self) -> _Scope:
         n = self.children
         self.children += 1
-        return _Scope(f"{self.prefix}t{n}/", self.ctx)
+        return _Scope(f"{self.prefix}t{n}/", self.ctx, self.err | _handling())
 
 
 _writer_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
@@ -177,6 +180,44 @@ def _writers() -> concurrent.futures.ThreadPoolExecutor:
         if _writer_pool is None:
             _writer_pool = concurrent.futures.ThreadPoolExecutor(max_workers=32, thread_name_prefix="pylinxi-journal")
         return _writer_pool
+
+
+def _handling() -> frozenset:
+    """Keys of the step failures propagating or being handled at this point of the
+    flow code: inside an `except`, a `finally` or an `__aexit__` that a StepFailed
+    is passing through, sys.exc_info() holds it (directly, as a cause/context, or in
+    an exception group)."""
+    exc = sys.exc_info()[1]
+    if exc is None:
+        return frozenset()
+    keys: Set[str] = set()
+    seen: Set[int] = set()
+    todo: List[Any] = [exc]
+    while todo:
+        x = todo.pop()
+        if x is None or id(x) in seen:
+            continue
+        seen.add(id(x))
+        if isinstance(x, StepFailed):
+            keys.add(x.key)
+        todo += [x.__cause__, x.__context__]
+        todo += list(getattr(x, "exceptions", ()) or ())
+    return frozenset(keys)
+
+
+_PKG_DIR = __file__.rsplit("/", 1)[0].rsplit("\\", 1)[0]
+
+
+def _call_site() -> str:
+    """Where flow code allocated a key: function and line offset within it (stable
+    across edits elsewhere in the file)."""
+    f: Optional[Any] = sys._getframe(2)
+    while f is not None and f.f_code.co_filename.startswith(_PKG_DIR):
+        f = f.f_back
+    if f is None:
+        return ""
+    code = f.f_code
+    return f"{getattr(code, 'co_qualname', code.co_name)}+{f.f_lineno - code.co_firstlineno}"
 
 
 def _scope_of(e: Entry) -> str:
@@ -315,6 +356,19 @@ class Context:
         self._inflight: Set[asyncio.Future] = set()
         self._last_write: Optional[concurrent.futures.Future] = None   # tail of this run's ordered writes
         self._armed: Dict[str, float] = {}       # timers set in this execution whose wait hasn't ended
+        self._awaited: List[str] = []            # signals being waited for right now (any branch)
+        self._busy: Dict[Any, int] = {}          # task -> durable-wait bookkeeping it is doing right now
+        self._cut_short = False                  # a branch was cancelled in the middle of a step
+        self.drain_timeout = 10.0
+        self._in_step: Dict[Any, int] = {}       # task -> steps it is executing right now
+        self._closing = False                    # the run is ending: no new step may start
+        self._tags: Dict[str, List[str]] = {}    # key -> step failures being handled when it was allocated
+        self._tagged_with: Set[str] = set()
+        self._sites: Dict[str, str] = {}         # tagged key -> call site
+        self._sup_cache: Dict[str, Entry] = {}   # superseded outcomes, replayed only from the same call site
+        start = next((e for e in history if e.kind == "start"), None)
+        # identifies this exact run (journal + incarnation), for the abandoned-attempt registry
+        self._incarnation = f"{journal._lock_ns()}|{run_id}|{start.sig if start else ''}"
 
         self._cache: Dict[str, Entry] = {}       # key -> successful outcome (persisted)
         self._failed: Dict[str, Entry] = {}      # key -> last failure with no later success
@@ -332,34 +386,31 @@ class Context:
         self._state_warned: Set[str] = set()
         superseded = self._superseded(history)
         for e in history:
-            if e.seq not in superseded:
-                self._absorb(e)
+            self._absorb(e, e.seq in superseded)
         self._snap = self._snapshot()
 
     @staticmethod
     def _superseded(history: List[Entry]) -> Set[int]:
-        """Entries recorded while a failure propagated out of the run (cleanup in a
-        `finally`, `__aexit__`, `except: ...; raise`) -- after the failed step, in its scope
-        or an enclosing one, up to the `uncaught:` marker. When the step is retried and
-        succeeds the flow takes another path, so those entries no longer bind replay;
-        if it fails again the cleanup runs again."""
+        """Entries the flow allocated while handling a step failure that then ended the
+        run (cleanup in a `finally`, `__aexit__`, `except: ...; raise`): their key was
+        tagged at allocation with the failures sys.exc_info() held. When the failed
+        step is retried and succeeds, the flow takes another path, so these entries
+        no longer bind replay order -- but they still replay if the flow reaches the
+        same key again (the side effect happened once). Entries allocated outside error
+        handling -- siblings that finished after the failure, steps the flow ran while
+        a branch's failure was pending -- are never superseded."""
+        uncaught = {e.key[len("uncaught:"):] for e in history
+                    if e.kind == "marker" and e.key.startswith("uncaught:")}
+        if not uncaught:
+            return set()
         out: Set[int] = set()
-        last_fail: Dict[str, Tuple[int, str]] = {}
-        for pos, e in enumerate(history):
-            if e.kind == "failed" and e.key != "flow":
-                last_fail[e.key] = (pos, _scope_of(e))
-            elif e.kind == "marker" and e.key.startswith("uncaught:"):
-                hit = last_fail.get(e.key[len("uncaught:"):])
-                if hit is None:
-                    continue
-                start, fscope = hit
-                for x in history[start + 1:pos]:
-                    if (x.kind in _KEYED and x.key != "flow" and not x.key.startswith(("caught:", "uncaught:"))
-                            and fscope.startswith(_scope_of(x))):
-                        out.add(x.seq)
+        for e in history:
+            tags = e.meta.get("pf") if e.kind in _INDEXED and isinstance(e.meta, dict) else None
+            if isinstance(tags, list) and uncaught.intersection(tags):
+                out.add(e.seq)
         return out
 
-    def _absorb(self, e: Entry) -> None:
+    def _absorb(self, e: Entry, superseded: bool = False) -> None:
         if e.kind == "inbox":
             if e.seq not in self._inbox_seqs:
                 self._inbox_seqs.add(e.seq)
@@ -373,6 +424,15 @@ class Context:
             self._caught.discard(e.key[len("uncaught:"):])
             return
         if e.kind not in _KEYED or e.key == "flow":   # run-level failures aren't replayed
+            return
+        if superseded:
+            # off the replay order (no divergence check, not "pending"), but a step
+            # reached again under the same key replays instead of running twice
+            if e.kind != "failed" and e.persisted:
+                self._sup_cache.setdefault(e.key, e)
+            if e.kind == "signal" and not e.meta.get("timed_out"):
+                n = e.meta.get("signal", "")
+                self._signals_used[n] = self._signals_used.get(n, 0) + 1
             return
         self._history_keys.add(e.key)
         idx = e.meta.get("i") if isinstance(e.meta, dict) else None
@@ -401,6 +461,41 @@ class Context:
                 self._finished_tasks.append(t)       # keep only tasks whose outcome matters
         task.add_done_callback(done)
 
+    @contextlib.contextmanager
+    def _busy_in(self) -> Iterator[None]:
+        me = asyncio.current_task()
+        self._busy[me] = self._busy.get(me, 0) + 1
+        try:
+            yield
+        finally:
+            left = self._busy.get(me, 1) - 1
+            if left:
+                self._busy[me] = left
+            else:
+                self._busy.pop(me, None)
+
+    async def _quiesce(self) -> None:
+        """A branch is about to suspend. A TaskGroup cancels its siblings the moment it
+        does, so first let them get to their own durable wait (or finish the step they
+        are in) -- otherwise their deadlines and progress would never be recorded and
+        the run could wake too late, or never. Bounded by drain_timeout."""
+        me = asyncio.current_task()
+        if me not in self._tasks:                  # the flow's own task: the run drains instead
+            return
+        deadline = time.monotonic() + self.drain_timeout
+        await asyncio.sleep(0)                     # let just-created siblings start
+        await asyncio.sleep(0)
+        while time.monotonic() < deadline:
+            busy = [t for t in self._tasks
+                    if t is not me and not t.done() and (t in self._in_step or t in self._busy)]
+            if not busy:
+                await asyncio.sleep(0)
+                if not any(t is not me and not t.done() and (t in self._in_step or t in self._busy)
+                           for t in self._tasks):
+                    return
+                continue
+            await asyncio.wait(busy, timeout=min(0.02, max(0.0, deadline - time.monotonic())))
+
     def _scope_now(self) -> _Scope:
         s = _scope.get()
         return s if s is not None and s.ctx is self else self._root
@@ -414,6 +509,14 @@ class Context:
         scope.total += 1
         key = f"{scope.prefix}{name}#{n}"
         self._alloc[key] = (scope.prefix, i)
+        tags = scope.err | _handling()
+        if tags:
+            self._tags[key] = sorted(tags)
+            self._tagged_with |= tags
+            self._sites[key] = _call_site()
+        sup = self._sup_cache.pop(key, None)
+        if sup is not None and key not in self._cache and sup.meta.get("at") == self._sites.get(key, _call_site()):
+            self._cache[key] = sup               # e.g. a `finally` cleanup reached again: it ran once already
         recorded = self._history_index.get((scope.prefix, i))
         if recorded is not None and recorded != key and key not in self._history_keys:
             self._divergence(key, recorded)
@@ -445,7 +548,7 @@ class Context:
     def _uncatch(self, keys: Set[str]) -> None:
         for k in keys:
             self._pending_failures.pop(k, None)
-            if k in self._caught:
+            if k in self._caught or k in self._tagged_with:
                 self._caught.discard(k)
                 self._record(f"uncaught:{k}", "marker", True, {})
 
@@ -480,6 +583,9 @@ class Context:
         if kind in _INDEXED and key in self._alloc:
             sc, i = self._alloc[key]
             meta = {**meta, "i": i, "sc": sc}
+            if key in self._tags:
+                meta["pf"] = self._tags[key]
+                meta["at"] = self._sites.get(key, "")
         return Entry(self.run_id, key, kind, result if persisted else None, delta, removed, meta, persisted)
 
     def _submit(self, e: Entry) -> concurrent.futures.Future:
@@ -487,14 +593,35 @@ class Context:
         they were built, one after another, from a worker thread (never through the
         event loop's task factory, so journaling can't disturb branch keys)."""
         prev, journal = self._last_write, self.journal
+        out: concurrent.futures.Future = concurrent.futures.Future()
 
-        def write() -> Entry:
-            if prev is not None:
-                concurrent.futures.wait([prev])
-            return journal.append(e)
-        cf = _writers().submit(write)
-        self._last_write = cf
-        return cf
+        def write() -> None:
+            if not out.set_running_or_notify_cancel():
+                return
+            try:
+                out.set_result(journal.append(e))
+            except BaseException as ex:  # noqa: BLE001 -- surfaced to whoever awaits the write
+                out.set_exception(ex)
+
+        def go(p: Optional[concurrent.futures.Future] = None) -> None:
+            if p is not None and not p.cancelled() and p.exception() is not None:
+                # an earlier write failed: don't journal later entries out of order
+                if out.set_running_or_notify_cancel():
+                    out.set_exception(p.exception())
+                return
+            try:
+                _writers().submit(write)
+            except RuntimeError:                     # interpreter shutting down
+                write()
+
+        # Chained on completion: no writer thread ever waits for another write, so a
+        # slow run can't occupy the pool and stall other runs' writes.
+        if prev is None:
+            go()
+        else:
+            prev.add_done_callback(go)
+        self._last_write = out
+        return out
 
     def _record(self, key: str, kind: str, result: Any, meta: dict, persisted: bool = True) -> None:
         """Journal an entry from synchronous code (markers). Ordered with every other
@@ -579,11 +706,36 @@ class Context:
             raise StepFailed(key, int(failed.meta.get("attempts", 1)),
                              cls(str(failed.meta.get("error", "step failed"))))
         await self._barrier()                     # earlier markers are durable before a side effect
+        if self._closing:                         # the run already ended (failed/finished): stop here
+            raise asyncio.CancelledError()
+        me = asyncio.current_task()
+        self._in_step[me] = self._in_step.get(me, 0) + 1      # busy until its outcome is journaled
+        try:
+            return await self._execute_step(key, fn, args, kwargs, policy, sensitive)
+        except asyncio.CancelledError:
+            if self._active and not self._closing:
+                self._cut_short = True             # its branch's own wait (if any) wasn't reached
+            raise
+        finally:
+            left = self._in_step.get(me, 1) - 1
+            if left:
+                self._in_step[me] = left
+            else:
+                self._in_step.pop(me, None)
+
+    async def _execute_step(self, key: str, fn: Callable, args: tuple, kwargs: dict,
+                            policy: Policy, sensitive: bool) -> Any:
         self.emit("started", key)
         ident = f"{self.run_id}:{key}"
         token: Optional[contextvars.Token] = _step_key.set(ident)
         try:
-            result, meta = await run_with_policy(key, fn, args, kwargs, policy, self.emit, ident)
+            result, meta = await run_with_policy(key, fn, args, kwargs, policy, self.emit,
+                                                 f"{self._incarnation}|{key}")
+        except PriorAttemptRunning as p:
+            # an earlier execution's attempt of this step is still running: its outcome is
+            # unknown, so neither fail the step nor run it again -- come back for its result
+            self.emit("attempt_pending", key, retry_at=p.retry_at)
+            raise Suspended(None, p.retry_at) from None
         except StepFailed as e:
             if token is not None:
                 _step_key.reset(token)
@@ -632,7 +784,8 @@ class Context:
             return self._armed[key]
         wake_at = time.time() + seconds
         self._armed[key] = wake_at
-        await self._arecord(key, "timer", {"wake_at": wake_at}, {"seconds": seconds})
+        with self._busy_in():
+            await self._arecord(key, "timer", {"wake_at": wake_at}, {"seconds": seconds})
         return wake_at
 
     async def sleep(self, seconds: float, inline_max: float = 1.0) -> None:
@@ -646,9 +799,11 @@ class Context:
             self._armed.pop(key, None)
             return
         if remaining <= inline_max:
-            await asyncio.sleep(remaining)
+            with self._busy_in():
+                await asyncio.sleep(remaining)
             self._armed.pop(key, None)
             return
+        await self._quiesce()
         raise Suspended(None, wake_at)
 
     def _take_signal(self, signal: str) -> Tuple[bool, Any]:
@@ -683,8 +838,12 @@ class Context:
             return cached.result
         got, value = self._take_signal(signal)
         if not got:
-            await self._refresh_inbox()
+            self._awaited.append(signal)          # counts for the suspension even if cancelled now
+            with self._busy_in():
+                await self._refresh_inbox()
             got, value = self._take_signal(signal)
+            if got:
+                self._awaited.remove(signal)
         if got:
             if tkey:
                 self._replay(tkey)
@@ -692,6 +851,7 @@ class Context:
             await self._arecord(key, "signal", value, {"signal": signal})
             return value
         if tkey is None:
+            await self._quiesce()
             raise Suspended(signal)
         wake_at = await self._timer(tkey, timeout)  # type: ignore[arg-type]
         if time.time() >= wake_at:
@@ -699,6 +859,7 @@ class Context:
             await self._arecord(key, "signal", default, {"signal": signal, "timed_out": True})
             self.emit("signal_timeout", key)
             return default
+        await self._quiesce()
         raise Suspended(signal, wake_at)
 
     def _unused_signals(self) -> Dict[str, List[Any]]:
@@ -1012,6 +1173,7 @@ class Flow:
         generation, root = int(s.get("generation", 0)), s.get("root", run_id)
 
         ctx = Context(run_id, self.journal, dict(s.get("state", {})), history, emit, generation, self.strict)
+        ctx.drain_timeout = self.drain_timeout
         token, scope_token = _current.set(ctx), _scope.set(ctx._root)
         try:
             try:
@@ -1026,6 +1188,9 @@ class Flow:
                 await self._drain(ctx)
                 raise
             finally:
+                ending = sys.exc_info()[1]
+                if not isinstance(ending, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                    await self._finish_steps(ctx)
                 await self._cancel_branches(ctx)
                 await ctx._settle()
         except Suspended as sp:
@@ -1084,6 +1249,11 @@ class Flow:
                 if x.wake_at is not None:
                     wakes.append(x.wake_at)
         wakes += list(ctx._armed.values())     # timers armed by branches that were cancelled first
+        if ctx._cut_short:                     # a branch cancelled mid-step never reached its own wait:
+            wakes.append(time.time() + 1.0)    # resume soon so it gets there and its deadline counts
+        for name in ctx._awaited:              # ...and signals they were waiting for
+            if name not in signals:
+                signals.append(name)
         wake_at = min(wakes) if wakes else None
         before = set(ctx._inbox_seqs)
         await ctx._arecord("suspend", "suspend", {"signal": signals[0] if signals else None, "signals": signals,
@@ -1119,6 +1289,16 @@ class Flow:
         pending = [t for t in ctx._tasks if not t.done()]
         if pending:
             await asyncio.wait(pending, timeout=self.drain_timeout)
+
+    async def _finish_steps(self, ctx: Context) -> None:
+        """The run is ending while branches still run. Steps already executing have
+        (or will have) done their side effect: let them finish and journal their
+        result, bounded by drain_timeout, so a resume replays them instead of running
+        them again. No branch may start a new step meanwhile."""
+        ctx._closing = True
+        busy = [t for t in ctx._tasks if not t.done() and t in ctx._in_step]
+        if busy:
+            await asyncio.wait(busy, timeout=self.drain_timeout)
 
     @staticmethod
     async def _cancel_branches(ctx: Context) -> None:

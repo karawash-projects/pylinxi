@@ -28,6 +28,22 @@ class AttemptStillRunning(Exception):
     another attempt alongside it (that could repeat a side effect)."""
 
 
+class PriorAttemptRunning(BaseException):
+    """An earlier execution of this run left an attempt of the step running (it was
+    cancelled by a drain, a crash of the caller, a timeout) and it is still running.
+    Its outcome is unknown, so the step must neither fail nor run again: the flow
+    suspends until `retry_at` and then picks up that attempt's result. A
+    BaseException so `except Exception` / `except StepFailed` in flow code can't
+    turn it into a permanent, journaled failure."""
+
+    def __init__(self, key: str, retry_at: float):
+        super().__init__(f"an earlier attempt of step {key!r} is still running")
+        self.key, self.retry_at = key, retry_at
+
+
+PRIOR_ATTEMPT_WAIT = 5.0      # seconds a resume waits on a still-running earlier attempt
+
+
 class StepFailed(Exception):
     def __init__(self, key: str, attempts: int, error: BaseException):
         super().__init__(f"step {key!r} failed after {attempts} attempt(s): {error!r}")
@@ -344,11 +360,15 @@ async def run_with_policy(key: str, fn: Callable, args: tuple, kwargs: dict,
     for attempt in range(max(1, r.attempts)):
         if abandoned is not None:                  # a timed-out sync attempt may still be running
             prev, abandoned = abandoned, None
+            from_prior = prior is not None and attempt == 0
+            wait = min(policy.timeout or PRIOR_ATTEMPT_WAIT, PRIOR_ATTEMPT_WAIT) if from_prior else \
+                (policy.timeout or 30.0)
             try:
-                late = await asyncio.wait_for(asyncio.shield(asyncio.wrap_future(prev.future)),
-                                              policy.timeout or 30.0)
+                late = await asyncio.wait_for(asyncio.shield(asyncio.wrap_future(prev.future)), wait)
             except asyncio.TimeoutError:
                 _abandon(ident, prev.future, prev.reusable)    # still running: later attempts must see it
+                if from_prior:                     # not this execution's attempt: wait for it, don't fail
+                    raise PriorAttemptRunning(key, time.time() + PRIOR_ATTEMPT_WAIT) from None
                 last = AttemptStillRunning(f"attempt {attempt} of step {key!r} is still running after "
                                            f"its timeout; not starting another one alongside it")
                 errors.append(f"AttemptStillRunning: {last}"[:300])
