@@ -41,7 +41,6 @@ nav:
   - Examples: examples.md
   - API reference: api.md
   - More:
-      - pylinxi and LangGraph: comparison.md
       - Development: contributing.md
       - Changelog: changelog.md
 

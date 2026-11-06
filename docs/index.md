@@ -38,14 +38,16 @@ pip install "pylinxi[postgres,otel]"   # production extras
     pylinxi is young: test it against your own failure modes before relying on it
     in production.
 
-## Why
+## Features
 
-| Gap in graph frameworks | pylinxi |
-|---|---|
-| **Manual graph wiring** for branching | The flow *is* the code: `if`, `match`, loops, `asyncio.gather`. `ctx.route()` replaces conditional edges in one line. Steps are plain functions outside a flow, so they unit-test without a harness. |
-| **Weak real-time self-healing** | One declarative policy per step: retry → validate → **repair** (rewrite inputs between attempts) → fallback → circuit breaker. Crashes heal by **resume**: finished steps replay from the journal. A `Worker` resumes due timers and transient failures fleet-wide. |
-| **Heavy state serialization** | Append-only **delta** journal: each entry stores one step's result plus only the state keys that changed. Rebuild any point in time with `state_at()`. Long loops roll over with `continue_as_new()`. |
-| **Enterprise security** | HMAC-signed hash chain with key rotation, automatic redaction, never-persisted sensitive steps, per-run locks, retention deletes, idempotency keys, OTel tracing, a `verify` CLI for audits. |
+- **Plain Python control flow** — `if`, loops, `asyncio.gather`, `TaskGroup`; no graph or DSL.
+- **Crash-proof execution** — resume any run by id, from any process; finished steps are never executed twice.
+- **Self-healing steps** — retry, timeout, validation, input repair, fallback and circuit breaker in one policy.
+- **Durable waits** — `ctx.sleep()` and `ctx.wait_for()` free the worker and survive restarts.
+- **Lightweight state** — per-step deltas instead of full snapshots, with point-in-time reconstruction.
+- **Tamper-evident audit trail** — signed hash chain, key rotation, redaction, retention deletes, `verify` CLI.
+- **Production backends** — memory, file, SQLite and PostgreSQL journals; many workers with locking and fencing.
+- **Zero core dependencies** — fully typed, Python 3.9–3.13.
 
 ## Where next
 

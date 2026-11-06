@@ -1,7 +1,7 @@
 """Human-in-the-loop approval. An expense waits for a manager's decision; if nobody
 answers in time it escalates to finance. The run is suspended while waiting (no
 process, thread or connection held), and the decision can arrive from anywhere --
-a web handler, a Slack button, another service -- via journal.send_signal().
+a web handler, a chat button, another service -- via journal.send_signal().
 A Worker resumes runs when a signal arrives or a deadline passes.
 Run:  python examples/approval_workflow.py
 """

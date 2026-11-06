@@ -36,7 +36,7 @@ Run as many worker processes as you like against one Postgres database:
 
 !!! warning
     Session advisory locks need a real session: don't put a transaction-pooling
-    proxy (e.g. pgbouncer in transaction mode) in front of pylinxi.
+    connection pooler in transaction-pooling mode in front of pylinxi.
 
 ## Make side effects idempotent
 
@@ -48,7 +48,7 @@ case:
 ```python
 @step
 def charge(order):
-    return stripe.PaymentIntent.create(amount=order.cents, idempotency_key=idempotency_key())
+    return payments.charge(order.cents, idempotency_key=idempotency_key())
 ```
 
 ## Trace
@@ -66,7 +66,7 @@ pylinxi.run support                  status, waiting_for, events: pylinxi.replay
   └─ pylinxi.step send               ERROR status if it finally failed
 ```
 
-Uses only the OpenTelemetry API; configure any exporter (OTLP, Jaeger, Datadog, Honeycomb) in your app. Replayed steps appear as events, not spans, so traces show what actually executed.
+Uses only the OpenTelemetry API; configure any exporter in your application. Replayed steps appear as events, not spans, so traces show what actually executed.
 
 ## Deploy while runs are in flight
 
