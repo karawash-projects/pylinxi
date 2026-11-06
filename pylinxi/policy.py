@@ -42,6 +42,7 @@ class PriorAttemptRunning(BaseException):
 
 
 PRIOR_ATTEMPT_WAIT = 5.0      # seconds a resume waits on a still-running earlier attempt
+PRIOR_ATTEMPT_MAX = 3600.0    # after this long, a stuck earlier attempt fails the step (AttemptStillRunning)
 
 
 class StepFailed(Exception):
@@ -181,7 +182,8 @@ _abandoned_guard = threading.Lock()
 _ABANDONED_TTL, _ABANDONED_MAX = 3600.0, 1024
 
 
-def _abandon(ident: Optional[str], fut: concurrent.futures.Future, reusable: bool) -> None:
+def _abandon(ident: Optional[str], fut: concurrent.futures.Future, reusable: bool,
+             since: Optional[float] = None) -> None:
     """Remember a sync attempt whose thread outlived its caller. A successful result
     is kept (bounded, for an hour) so the next attempt of that step uses it instead of
     running the side effect again."""
@@ -193,7 +195,7 @@ def _abandon(ident: Optional[str], fut: concurrent.futures.Future, reusable: boo
             del _abandoned[k]
         while len(_abandoned) >= _ABANDONED_MAX:
             del _abandoned[next(iter(_abandoned))]
-        _abandoned[ident] = (fut, reusable, now)
+        _abandoned[ident] = (fut, reusable, now if since is None else since)
 
     def settled(f: Any) -> None:
         keep = reusable and not f.cancelled() and f.exception() is None
@@ -204,12 +206,12 @@ def _abandon(ident: Optional[str], fut: concurrent.futures.Future, reusable: boo
     fut.add_done_callback(settled)
 
 
-def _claim(ident: Optional[str]) -> Optional[Tuple[Any, bool]]:
+def _claim(ident: Optional[str]) -> Optional[Tuple[Any, bool, float]]:
     if ident is None:
         return None
     with _abandoned_guard:
         v = _abandoned.pop(ident, None)
-    return (v[0], v[1]) if v is not None else None
+    return (v[0], v[1], v[2]) if v is not None else None
 
 
 def _aggregate(chunks: list, agg: Optional[Callable[[list], Any]]) -> Any:
@@ -342,8 +344,10 @@ async def run_with_policy(key: str, fn: Callable, args: tuple, kwargs: dict,
     breaker_blocked = False
     abandoned: Optional[_ThreadTimeout] = None
     prior = _claim(ident)                         # an earlier execution's attempt may still be running
+    since: Optional[float] = None                 # when that earlier attempt was first abandoned
     if prior is not None:
         abandoned = _ThreadTimeout(prior[0], prior[1])
+        since = prior[2]
 
     async def checked(result: Any) -> Any:
         if policy.validate is not None and not await _maybe_await(policy.validate(result)):
@@ -363,12 +367,15 @@ async def run_with_policy(key: str, fn: Callable, args: tuple, kwargs: dict,
             from_prior = prior is not None and attempt == 0
             wait = min(policy.timeout or PRIOR_ATTEMPT_WAIT, PRIOR_ATTEMPT_WAIT) if from_prior else \
                 (policy.timeout or 30.0)
+            keep_since = since if from_prior else None
             try:
                 late = await asyncio.wait_for(asyncio.shield(asyncio.wrap_future(prev.future)), wait)
             except asyncio.TimeoutError:
-                _abandon(ident, prev.future, prev.reusable)    # still running: later attempts must see it
-                if from_prior:                     # not this execution's attempt: wait for it, don't fail
+                _abandon(ident, prev.future, prev.reusable, keep_since)   # still running: later attempts see it
+                stuck_for = time.monotonic() - since if (from_prior and since is not None) else 0.0
+                if from_prior and stuck_for < PRIOR_ATTEMPT_MAX:   # wait for it, don't fail the step
                     raise PriorAttemptRunning(key, time.time() + PRIOR_ATTEMPT_WAIT) from None
+                # this execution's own attempt, or an earlier one stuck for too long: give up on it
                 last = AttemptStillRunning(f"attempt {attempt} of step {key!r} is still running after "
                                            f"its timeout; not starting another one alongside it")
                 errors.append(f"AttemptStillRunning: {last}"[:300])
@@ -376,6 +383,9 @@ async def run_with_policy(key: str, fn: Callable, args: tuple, kwargs: dict,
                 break
             except Exception:  # noqa: BLE001 -- that attempt failed after all: retry as planned
                 pass
+            except BaseException:                  # cancelled while waiting: keep remembering it
+                _abandon(ident, prev.future, prev.reusable, keep_since)
+                raise
             else:
                 if prev.reusable:                  # it finished: use its result, don't run again
                     try:

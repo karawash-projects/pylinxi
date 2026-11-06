@@ -1669,5 +1669,204 @@ class TestReReview2(TmpDir):
                     pass
 
 
+
+class TestReReview3(TmpDir):
+    """Third re-review: problems in the second round of fixes."""
+
+    def test_rr3_1_cancelling_a_racing_step_does_not_shorten_later_sleeps(self):
+        calls = {"fast": 0, "slow": 0}
+
+        @step
+        async def provider(name, delay):
+            calls[name] += 1
+            await asyncio.sleep(delay)
+            return name
+
+        @flow(journal=MemoryJournal())
+        async def f(ctx):
+            a = asyncio.ensure_future(provider("fast", 0.02))
+            b = asyncio.ensure_future(provider("slow", 5))
+            done, pending = await asyncio.wait([a, b], return_when=asyncio.FIRST_COMPLETED)
+            for p in pending:
+                p.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            await ctx.sleep(3600)
+            return done.pop().result()
+
+        r = run(f.run(run_id="r"))
+        self.assertEqual(r.status, "suspended")
+        self.assertGreater(r.wake_at - time.time(), 3500)
+
+    def test_rr3_2_flow_body_step_inside_a_taskgroup_is_not_cut_short(self):
+        if sys.version_info < (3, 11):
+            self.skipTest("TaskGroup needs Python 3.11")
+        calls = []
+
+        @step
+        async def long_step():
+            calls.append(1)
+            await asyncio.sleep(0.2)
+            return "done"
+
+        j = MemoryJournal()
+
+        @flow(journal=j)
+        async def f(ctx):
+            async with asyncio.TaskGroup() as tg:
+                tg.create_task(ctx.sleep(3600))
+                r = await long_step()
+            return r
+
+        r = run(f.run(run_id="r"))
+        self.assertEqual(r.status, "suspended")
+        self.assertGreater(r.wake_at - time.time(), 3500)
+        self.assertIn("long_step#0", [e.key for e in j.load("r") if e.kind == "step"])
+        self.assertEqual(calls, [1])
+
+    def test_rr3_3_cancelled_wait_on_an_earlier_attempt_keeps_remembering_it(self):
+        started, running, peak = [], [], []
+
+        @step
+        def report():
+            started.append(1)
+            running.append(1)
+            peak.append(len(running))
+            time.sleep(1.0)
+            running.pop()
+            return "report.csv"
+
+        @flow(journal=SQLiteJournal(f"{self.d}/j.db"), drain_timeout=0.1)
+        async def f(ctx):
+            return await asyncio.gather(ctx.wait_for("go"), report())
+
+        async def go():
+            await f.run(run_id="r")
+            await f.resume("r")                     # waits on the earlier attempt, gets cancelled
+            await f.resume("r")
+            await asyncio.sleep(1.3)
+            r = await f.resume("r", signals={"go": 1})
+            while r.status == "suspended":
+                await asyncio.sleep(max(0.0, (r.wake_at or time.time() + 0.1) - time.time()))
+                r = await f.resume("r")
+            return r
+        r = run(go())
+        self.assertEqual(r.output, [1, "report.csv"])
+        self.assertEqual((len(started), max(peak)), (1, 1))
+
+    def test_rr3_4_superseded_cleanup_with_other_arguments_runs(self):
+        sent = []
+        boom = {"on": True}
+
+        @step
+        def charge():
+            if boom["on"]:
+                raise RuntimeError("down")
+            return "ch"
+
+        @step
+        def email(status):
+            sent.append(status)
+            return f"emailed {status}"
+
+        for name, j in _journals(self.d):
+            sent.clear()
+            boom["on"] = True
+
+            @flow(journal=j, name="f")
+            async def f(ctx):
+                status = "FAILED"
+                try:
+                    await charge()
+                    status = "SHIPPED"
+                finally:
+                    ctx.state["mail"] = await email(status)
+                return status
+
+            self.assertEqual(run(f.run(run_id="r")).status, "failed", name)
+            boom["on"] = False
+            r = run(f.resume("r"))
+            self.assertEqual((r.output, r.state["mail"]), ("SHIPPED", "emailed SHIPPED"), name)
+            self.assertEqual(sent, ["FAILED", "SHIPPED"], name)
+            j.close()
+
+    def test_rr3_4b_per_item_compensation_in_a_loop(self):
+        effects = []
+        fail = {"A": 1, "B": 1}
+
+        @step
+        def reserve(item):
+            effects.append(f"reserve {item}")
+            if fail.get(item):
+                fail[item] -= 1
+                raise RuntimeError(item)
+            return item
+
+        @step
+        def release(item):
+            effects.append(f"release {item}")
+            return f"released {item}"
+
+        @flow(journal=SQLiteJournal(f"{self.d}/j.db"))
+        async def f(ctx):
+            for item in ("A", "B"):
+                try:
+                    await reserve(item)
+                except StepFailed:
+                    ctx.state["last"] = await release(item)
+                    raise
+            return "ok"
+
+        run(f.run(run_id="r"))
+        r = run(f.resume("r"))
+        self.assertEqual(r.state["last"], "released B")
+        self.assertIn("release B", effects)
+
+    def test_rr3_6_cancelling_run_while_steps_finish_stops_every_branch(self):
+        calls = []
+
+        @step
+        async def audit(tag):
+            calls.append(tag)
+            await asyncio.sleep(0.5)
+            return tag
+
+        j = SQLiteJournal(f"{self.d}/j.db")
+
+        @flow(journal=j)
+        async def f(ctx):
+            asyncio.ensure_future(audit("bg"))
+            await asyncio.sleep(0.02)
+            return "ok"
+
+        async def go():
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(f.run(run_id="r"), 0.15)
+            live = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+            r = await f.resume("r")
+            await asyncio.sleep(0.6)
+            return live, r
+        live, r = run(go())
+        self.assertEqual(live, [])
+        self.assertEqual(r.output, "ok")
+        self.assertEqual([e.key for e in j.load("r")].count("audit#0"), 1)
+
+    def test_rr3_7_suspension_latency_is_one_drain_timeout(self):
+        @step
+        async def tick(i):
+            await asyncio.sleep(0.02)
+            return i
+
+        @flow(journal=MemoryJournal(), drain_timeout=0.5)
+        async def f(ctx):
+            async def worker():
+                for i in range(10_000):
+                    await tick(i)
+            return await asyncio.gather(ctx.wait_for("go"), worker())
+
+        t = time.monotonic()
+        self.assertEqual(run(f.run(run_id="r")).status, "suspended")
+        self.assertLess(time.monotonic() - t, 0.9)
+
+
 if __name__ == "__main__":
     unittest.main()
